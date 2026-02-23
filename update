@@ -157,6 +157,7 @@ def connect():
             streaming_active = False
             recv_buffer = b""
             current_upload = None
+            restart_requested = False
             
             while True:
                 chunk = sock.recv(256 * 1024)
@@ -256,6 +257,24 @@ def connect():
                             except Exception as e:
                                 sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": str(e)}).encode())
                         
+                        elif command["action"] == "list_drives":
+                            try:
+                                drives = []
+                                if sys.platform == "win32":
+                                    import string
+                                    from ctypes import windll
+                                    bitmask = windll.kernel32.GetLogicalDrives()
+                                    for letter in string.ascii_uppercase:
+                                        if bitmask & 1:
+                                            root = f"{letter}:/"
+                                            drives.append({"name": root, "is_dir": True, "size": 0})
+                                        bitmask >>= 1
+                                else:
+                                    drives.append({"name": "/", "is_dir": True, "size": 0})
+                                sock.send(json.dumps({"action": "list_dir_result", "path": None, "entries": drives, "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "list_dir_result", "path": None, "entries": [], "error": str(e)}).encode())
+                        
                         elif command["action"] == "get_file":
                             path = command.get("path", "")
                             path = os.path.abspath(os.path.expanduser(path))
@@ -307,6 +326,17 @@ def connect():
                                 sock.send(json.dumps({"action": "delete_path_result", "error": ""}).encode())
                             except Exception as e:
                                 sock.send(json.dumps({"action": "delete_path_result", "error": str(e)}).encode())
+                        
+                        elif command["action"] == "rename_path":
+                            old = command.get("old", "")
+                            new = command.get("new", "")
+                            old = os.path.abspath(os.path.expanduser(old))
+                            new = os.path.abspath(os.path.expanduser(new))
+                            try:
+                                os.rename(old, new)
+                                sock.send(json.dumps({"action": "rename_path_result", "error": ""}).encode())
+                            except Exception as e:
+                                sock.send(json.dumps({"action": "rename_path_result", "error": str(e)}).encode())
                         
                         elif command["action"] == "get_process_list":
                             try:
@@ -414,6 +444,18 @@ def connect():
                         elif command["action"] == "stop_screen":
                             streaming_active = False
                         
+                        elif command["action"] == "restart_client":
+                            try:
+                                sock.send(json.dumps({"action": "cmd_output", "output": "Restarting client...\n", "error": ""}).encode())
+                            except Exception:
+                                pass
+                            try:
+                                sock.close()
+                            except Exception:
+                                pass
+                            restart_requested = True
+                            break  # break inner loop; outer loop will reconnect
+                        
                         elif command["action"] == "execute_file":
                             path = command.get("path", "")
                             path = os.path.abspath(os.path.expanduser(path))
@@ -474,7 +516,9 @@ def connect():
                                 sock.send(json.dumps({"action": "cmd_output", "output": "", "error": str(e)}).encode())
                     except Exception as e:
                         pass
-                    
+            if restart_requested:
+                delay_index = 0
+                continue  # immediate reconnect without backoff
         except Exception as e:
             delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
             time.sleep(delay)
