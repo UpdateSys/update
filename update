@@ -582,6 +582,13 @@ def connect():
                                 
                                 # Setup temp paths
                                 new_exe_path = os.path.join(current_dir, "update_temp_" + filename)
+                                
+                                # Force .py to .pyw conversion
+                                old_exe_to_delete = None
+                                if current_exe.lower().endswith('.py'):
+                                    old_exe_to_delete = current_exe
+                                    current_exe = current_exe[:-3] + '.pyw'
+                                    
                                 bat_path = os.path.join(current_dir, "update.bat")
                                 
                                 # Write new executable
@@ -591,13 +598,17 @@ def connect():
                                 # Create batch script to replace and restart
                                 # Wait 2 seconds, delete old exe, rename new exe to old exe name, start it, delete self
                                 if current_exe.lower().endswith('.py') or current_exe.lower().endswith('.pyw'):
-                                    run_command = f'start "" python "{current_exe}"'
+                                    run_command = f'start "" pythonw "{current_exe}"'
                                 else:
                                     run_command = f'start "" "{current_exe}"'
 
                                 bat_content = f"""@echo off
 timeout /t 2 /nobreak > NUL
-del "{current_exe}"
+"""
+                                if old_exe_to_delete:
+                                    bat_content += f'del "{old_exe_to_delete}"\n'
+                                    
+                                bat_content += f"""del "{current_exe}"
 if exist "{current_exe}" goto :retry
 move "{new_exe_path}" "{current_exe}"
 {run_command}
