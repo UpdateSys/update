@@ -596,14 +596,22 @@ def connect():
                                     f.write(file_data)
                                 
                                 # Create batch script to replace and restart
-                                # Wait 2 seconds, delete old exe, rename new exe to old exe name, start it, delete self
-                                if current_exe.lower().endswith('.py') or current_exe.lower().endswith('.pyw'):
-                                    run_command = f'start "" pythonw "{current_exe}"'
+                                # Use ping instead of timeout for better compatibility
+                                # Get absolute path to python interpreter if running as script
+                                is_script = not getattr(sys, 'frozen', False)
+                                interpreter = sys.executable
+                                
+                                if is_script:
+                                    if interpreter.lower().endswith('python.exe'):
+                                        alt_interpreter = interpreter[:-10] + 'pythonw.exe'
+                                        if os.path.exists(alt_interpreter):
+                                            interpreter = alt_interpreter
+                                    run_command = f'start "" "{interpreter}" "{current_exe}"'
                                 else:
                                     run_command = f'start "" "{current_exe}"'
 
                                 bat_content = f"""@echo off
-timeout /t 2 /nobreak > NUL
+ping 127.0.0.1 -n 3 > nul
 """
                                 if old_exe_to_delete:
                                     bat_content += f'del "{old_exe_to_delete}"\n'
@@ -613,13 +621,15 @@ if exist "{current_exe}" goto :retry
 move "{new_exe_path}" "{current_exe}"
 {run_command}
 del "%~f0"
+exit
 :retry
-timeout /t 1 /nobreak > NUL
+ping 127.0.0.1 -n 2 > nul
 del "{current_exe}"
 if not exist "{current_exe}" (
     move "{new_exe_path}" "{current_exe}"
     {run_command}
     del "%~f0"
+    exit
 ) else (
     goto :retry
 )
@@ -635,7 +645,8 @@ if not exist "{current_exe}" (
                                     
                                 # Execute batch script detached and exit
                                 if sys.platform == "win32":
-                                    subprocess.Popen(bat_path, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                                    # CREATE_NO_WINDOW = 0x08000000. 
+                                    subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=0x08000000)
                                 else:
                                     # Fallback for non-windows (though batch is windows specific, client seems win focused)
                                     subprocess.Popen(["sh", "-c", f"sleep 2; rm '{current_exe}'; mv '{new_exe_path}' '{current_exe}'; '{current_exe}' &"])
